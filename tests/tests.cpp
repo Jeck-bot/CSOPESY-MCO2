@@ -422,7 +422,7 @@ TEST(singleInstructionBudgetNeverMakesALoop) {
     bool noLoop = true;
     for (uint32_t seed = 1; seed <= 500; ++seed) {
         std::minstd_rand rng(seed);
-        Instruction statement = randomStatement(rng, "p01", 0, 1);
+        Instruction statement = randomStatement(rng, "p01", 1024, 0, 1);
         noLoop = noLoop && statement.type != InstructionType::FOR && executedCount(statement) == 1;
     }
     CHECK(noLoop);
@@ -436,7 +436,7 @@ TEST(randomStatementsStayWithinTheirBudget) {
     for (uint64_t budget : budgets) {
         for (uint32_t seed = 1; seed <= 2000; ++seed) {
             std::minstd_rand rng(seed);
-            Instruction statement = randomStatement(rng, "p01", 0, budget);
+            Instruction statement = randomStatement(rng, "p01", 1024, 0, budget);
             uint64_t count = executedCount(statement);
             withinBudget = withinBudget && count >= 1 && count <= budget;
             wellFormed = wellFormed && loopsAreWellFormed(statement);
@@ -449,19 +449,60 @@ TEST(randomStatementsStayWithinTheirBudget) {
 }
 
 TEST(generatesEveryInstructionType) {
-    bool seen[6] = {};
-    std::minstd_rand rng(42);
-    for (int i = 0; i < 600; ++i) {
-        seen[static_cast<int>(randomStatement(rng, "p01", 0, 1000).type)] = true;
+    std::set<InstructionType> seen;
+    for (uint32_t seed = 1; seed <= 2000; ++seed) {
+        std::minstd_rand rng(seed);
+        seen.insert(randomStatement(rng, "p01", 1024, 0, 1000).type);
     }
-    CHECK(seen[0] && seen[1] && seen[2] && seen[3] && seen[4] && seen[5]);
+    CHECK(seen.size() == 8);
+    CHECK(seen.count(InstructionType::READ) == 1);
+    CHECK(seen.count(InstructionType::WRITE) == 1);
+}
+
+TEST(readAndWriteUseEvenAddressesPastTheSymbolTable) {
+    bool foundRead = false;
+    bool foundWrite = false;
+    bool valid = true;
+    for (uint32_t seed = 1; seed <= 2000; ++seed) {
+        std::minstd_rand rng(seed);
+        Instruction statement = randomStatement(rng, "p01", 1024, 0, 1);
+        if (statement.type == InstructionType::READ) {
+            foundRead = true;
+            valid = valid && isPoolVariable(statement.variable);
+        }
+        if (statement.type == InstructionType::WRITE) {
+            foundWrite = true;
+            valid = valid && (!statement.first.isVariable || isPoolVariable(statement.first.variable));
+        }
+        if (statement.type == InstructionType::READ || statement.type == InstructionType::WRITE) {
+            valid = valid && statement.address % 2 == 0 && statement.address >= 64 && statement.address <= 1022;
+        }
+    }
+    CHECK(foundRead);
+    CHECK(foundWrite);
+    CHECK(valid);
+}
+
+TEST(smallestProcessesReadAndWriteAnywhereInTheirMemory) {
+    bool found = false;
+    bool inRange = true;
+    for (uint32_t seed = 1; seed <= 2000; ++seed) {
+        std::minstd_rand rng(seed);
+        Instruction statement = randomStatement(rng, "p01", 64, 0, 1);
+        if (statement.type == InstructionType::READ || statement.type == InstructionType::WRITE) {
+            found = true;
+            inRange = inRange && statement.address % 2 == 0 && statement.address <= 62;
+        }
+    }
+    CHECK(found);
+    CHECK(inRange);
 }
 
 TEST(neverStartsALoopAtTheNestingLimit) {
     bool noLoop = true;
     std::minstd_rand rng(7);
     for (int i = 0; i < 1000; ++i) {
-        noLoop = noLoop && randomStatement(rng, "p01", kMaxForNesting, 1000).type != InstructionType::FOR;
+        noLoop = noLoop && randomStatement(rng, "p01", 1024, kMaxForNesting, 1000).type != InstructionType::FOR;
     }
     CHECK(noLoop);
 }
@@ -471,7 +512,7 @@ TEST(printUsesTheDefaultHelloWorldMessage) {
     bool defaultMessage = true;
     std::minstd_rand rng(3);
     for (int i = 0; i < 300; ++i) {
-        Instruction statement = randomStatement(rng, "screen_01", 0, 1);
+        Instruction statement = randomStatement(rng, "screen_01", 1024, 0, 1);
         if (statement.type == InstructionType::PRINT) {
             foundPrint = true;
             defaultMessage = defaultMessage && statement.message == "Hello world from screen_01!" &&
@@ -487,7 +528,7 @@ TEST(sleepLastsOneToTenTicks) {
     bool inRange = true;
     std::minstd_rand rng(5);
     for (int i = 0; i < 300; ++i) {
-        Instruction statement = randomStatement(rng, "p01", 0, 1);
+        Instruction statement = randomStatement(rng, "p01", 1024, 0, 1);
         if (statement.type == InstructionType::SLEEP) {
             foundSleep = true;
             inRange = inRange && statement.sleepTicks >= 1 && statement.sleepTicks <= 10;
@@ -502,7 +543,7 @@ TEST(arithmeticUsesVariablesFromThePool) {
     bool valid = true;
     std::minstd_rand rng(11);
     for (int i = 0; i < 300; ++i) {
-        Instruction statement = randomStatement(rng, "p01", 0, 1);
+        Instruction statement = randomStatement(rng, "p01", 1024, 0, 1);
         if (statement.type == InstructionType::DECLARE) {
             valid = valid && isPoolVariable(statement.variable);
         }

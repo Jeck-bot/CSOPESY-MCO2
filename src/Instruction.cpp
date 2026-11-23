@@ -30,6 +30,19 @@ Operand randomOperand(std::minstd_rand& rng) {
     return operand;
 }
 
+// An even address holding a whole uint16 inside the process's memory. It is past the 64-byte
+// symbol table unless the symbol table is all of the memory.
+uint64_t randomAddress(std::minstd_rand& rng, uint64_t memoryBytes) {
+    uint64_t low = memoryBytes > 64 ? 64 : 0;
+    return 2 * randomBetween(rng, low / 2, (memoryBytes - 2) / 2);
+}
+
+// The types generated besides FOR, which is only possible below the nesting limit.
+const InstructionType kSimpleTypes[] = {InstructionType::PRINT,    InstructionType::DECLARE, InstructionType::ADD,
+                                        InstructionType::SUBTRACT, InstructionType::SLEEP,   InstructionType::READ,
+                                        InstructionType::WRITE};
+constexpr uint64_t kSimpleTypeCount = sizeof(kSimpleTypes) / sizeof(kSimpleTypes[0]);
+
 } // namespace
 
 uint64_t executedCount(const Instruction& statement) {
@@ -43,10 +56,12 @@ uint64_t executedCount(const Instruction& statement) {
     return bodyCount * statement.repeats;
 }
 
-Instruction randomStatement(std::minstd_rand& rng, const std::string& processName, int depth, uint64_t maxCount) {
+Instruction randomStatement(std::minstd_rand& rng, const std::string& processName, uint64_t memoryBytes, int depth,
+                            uint64_t maxCount) {
     bool canLoop = depth < kMaxForNesting && maxCount >= 2;
+    uint64_t choice = randomBetween(rng, 0, canLoop ? kSimpleTypeCount : kSimpleTypeCount - 1);
     Instruction statement;
-    statement.type = static_cast<InstructionType>(randomBetween(rng, 0, canLoop ? 5 : 4));
+    statement.type = choice < kSimpleTypeCount ? kSimpleTypes[choice] : InstructionType::FOR;
 
     switch (statement.type) {
     case InstructionType::PRINT:
@@ -65,6 +80,14 @@ Instruction randomStatement(std::minstd_rand& rng, const std::string& processNam
     case InstructionType::SLEEP:
         statement.sleepTicks = static_cast<uint8_t>(randomBetween(rng, 1, 10));
         break;
+    case InstructionType::READ:
+        statement.variable = randomVariable(rng);
+        statement.address = randomAddress(rng, memoryBytes);
+        break;
+    case InstructionType::WRITE:
+        statement.address = randomAddress(rng, memoryBytes);
+        statement.first = randomOperand(rng);
+        break;
     case InstructionType::FOR: {
         // The body runs `repeats` times, so it may use at most maxCount / repeats instructions.
         statement.repeats = static_cast<uint16_t>(randomBetween(rng, 2, std::min<uint64_t>(5, maxCount)));
@@ -74,7 +97,8 @@ Instruction randomStatement(std::minstd_rand& rng, const std::string& processNam
         for (uint64_t i = 0; i < length; ++i) {
             // Leave at least one instruction for each statement still to come.
             uint64_t statementsLeft = length - i - 1;
-            Instruction child = randomStatement(rng, processName, depth + 1, bodyBudget - used - statementsLeft);
+            Instruction child =
+                randomStatement(rng, processName, memoryBytes, depth + 1, bodyBudget - used - statementsLeft);
             used += executedCount(child);
             statement.body.push_back(std::move(child));
         }
