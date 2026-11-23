@@ -285,6 +285,81 @@ TEST(loadConfigReportsMissingFile) {
     CHECK(contains(error, "no-such-config-file.txt"));
 }
 
+TEST(parsesMemoryParameters) {
+    Config config;
+    std::string error;
+    CHECK(parse("num-cpu 4\nscheduler \"rr\"\nquantum-cycles 5\nbatch-process-freq 1\nmin-ins 1000\nmax-ins 2000\n"
+                "delay-per-exec 0\nmax-overall-mem 1024\nmem-per-frame 64\nmin-mem-per-proc 128\nmax-mem-per-proc 512\n",
+                config, error));
+    CHECK(config.maxOverallMem == 1024);
+    CHECK(config.memPerFrame == 64);
+    CHECK(config.minMemPerProc == 128);
+    CHECK(config.maxMemPerProc == 512);
+}
+
+TEST(memoryParametersDefaultWhenMissing) {
+    Config config;
+    config.maxOverallMem = 64;
+    std::string error;
+    CHECK(parse("num-cpu 2", config, error));
+    CHECK(config.maxOverallMem == 16384);
+    CHECK(config.memPerFrame == 256);
+    CHECK(config.minMemPerProc == 4096);
+    CHECK(config.maxMemPerProc == 4096);
+}
+
+TEST(acceptsMaxMemProcSpelling) {
+    Config config;
+    std::string error;
+    CHECK(parse("min-mem-per-proc 64 max-mem-proc 128", config, error));
+    CHECK(config.maxMemPerProc == 128);
+}
+
+TEST(memorySizesArePowersOfTwoFrom64To65536) {
+    CHECK(isValidMemorySize(64));
+    CHECK(isValidMemorySize(1024));
+    CHECK(isValidMemorySize(65536));
+    CHECK(!isValidMemorySize(0));
+    CHECK(!isValidMemorySize(32));
+    CHECK(!isValidMemorySize(100));
+    CHECK(!isValidMemorySize(131072));
+}
+
+TEST(rejectsMemoryValuesThatAreNotValidSizes) {
+    Config config;
+    std::string error;
+    CHECK(!parse("max-overall-mem 1000", config, error));
+    CHECK(contains(error, "max-overall-mem"));
+    CHECK(contains(error, "must be a power of 2 from 64 to 65536"));
+    CHECK(!parse("mem-per-frame 32", config, error));
+    CHECK(!parse("min-mem-per-proc 131072", config, error));
+    CHECK(!parse("max-mem-per-proc abc", config, error));
+    CHECK(!parse("max-mem-per-proc 99999999999999999999999", config, error));
+}
+
+TEST(rejectsFrameLargerThanMemory) {
+    Config config;
+    std::string error;
+    CHECK(!parse("max-overall-mem 256 mem-per-frame 512", config, error));
+    CHECK(contains(error, "mem-per-frame"));
+    CHECK(parse("max-overall-mem 256 mem-per-frame 256", config, error));
+}
+
+TEST(rejectsMinMemAboveMaxMem) {
+    Config config;
+    std::string error;
+    CHECK(!parse("min-mem-per-proc 2048 max-mem-per-proc 1024", config, error));
+    CHECK(contains(error, "min-mem-per-proc"));
+}
+
+TEST(leavesConfigUnchangedOnMemoryError) {
+    Config config;
+    config.maxOverallMem = 512;
+    std::string error;
+    CHECK(!parse("max-overall-mem 1024 mem-per-frame 100", config, error));
+    CHECK(config.maxOverallMem == 512);
+}
+
 // ---- Instruction ----
 
 namespace {
