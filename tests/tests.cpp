@@ -20,6 +20,7 @@
 // Process.h, since Windows file names are case-insensitive.
 #include "../src/Config.h"
 #include "../src/Instruction.h"
+#include "../src/InstructionParser.h"
 #include "../src/Process.h"
 #include "../src/Scheduler.h"
 #include "../src/Utils.h"
@@ -556,6 +557,207 @@ TEST(arithmeticUsesVariablesFromThePool) {
     }
     CHECK(foundArithmetic);
     CHECK(valid);
+}
+
+// ---- Instruction parser ----
+
+namespace {
+
+// The spec's sample screen -c program, as it reads once the \" escapes are removed.
+const char* const kSpecProgram =
+    "DECLARE varA 10; DECLARE varB 5; ADD varA varA varB; WRITE 0x500 varA; READ varC 0x500; "
+    "PRINT(\"Result: \" + varC)";
+
+// count copies of statement, separated by semicolons.
+std::string repeated(const std::string& statement, int count) {
+    std::string text;
+    for (int i = 0; i < count; ++i) {
+        text += (i > 0 ? "; " : "") + statement;
+    }
+    return text;
+}
+
+bool isVariable(const Operand& operand, const std::string& name) {
+    return operand.isVariable && operand.variable == name;
+}
+
+bool isLiteral(const Operand& operand, uint16_t value) {
+    return !operand.isVariable && operand.value == value;
+}
+
+}  // namespace
+
+TEST(parsesTheSpecSampleProgram) {
+    std::optional<std::vector<Instruction>> program = parseProgram(kSpecProgram);
+    CHECK(program.has_value() && program->size() == 6);
+    if (!program || program->size() != 6) {
+        return;
+    }
+    const std::vector<Instruction>& p = *program;
+    CHECK(p[0].type == InstructionType::DECLARE && p[0].variable == "varA" && p[0].first.value == 10);
+    CHECK(p[1].type == InstructionType::DECLARE && p[1].variable == "varB" && p[1].first.value == 5);
+    CHECK(p[2].type == InstructionType::ADD && p[2].variable == "varA" && isVariable(p[2].first, "varA") &&
+          isVariable(p[2].second, "varB"));
+    CHECK(p[3].type == InstructionType::WRITE && p[3].address == 0x500 && isVariable(p[3].first, "varA"));
+    CHECK(p[4].type == InstructionType::READ && p[4].variable == "varC" && p[4].address == 1280);
+    CHECK(p[5].type == InstructionType::PRINT && p[5].message == "Result: " && p[5].variable == "varC");
+}
+
+TEST(parsesTheParenthesizedForm) {
+    std::optional<std::vector<Instruction>> program =
+        parseProgram("DECLARE(varA, 10); ADD(varA, varA, 5); SUBTRACT(x, 7, y); SLEEP(3); READ(v, 0x40); WRITE(0x42, 9)");
+    CHECK(program.has_value() && program->size() == 6);
+    if (!program || program->size() != 6) {
+        return;
+    }
+    const std::vector<Instruction>& p = *program;
+    CHECK(p[0].type == InstructionType::DECLARE && p[0].variable == "varA" && p[0].first.value == 10);
+    CHECK(p[1].type == InstructionType::ADD && p[1].variable == "varA" && isVariable(p[1].first, "varA") &&
+          isLiteral(p[1].second, 5));
+    CHECK(p[2].type == InstructionType::SUBTRACT && p[2].variable == "x" && isLiteral(p[2].first, 7) &&
+          isVariable(p[2].second, "y"));
+    CHECK(p[3].type == InstructionType::SLEEP && p[3].sleepTicks == 3);
+    CHECK(p[4].type == InstructionType::READ && p[4].variable == "v" && p[4].address == 0x40);
+    CHECK(p[5].type == InstructionType::WRITE && p[5].address == 0x42 && isLiteral(p[5].first, 9));
+}
+
+TEST(addressesAreHexWithOrWithoutPrefix) {
+    std::optional<std::vector<Instruction>> program = parseProgram("WRITE 42 9; READ v 0X1f; READ w 0x00A0");
+    CHECK(program.has_value() && program->size() == 3);
+    if (program && program->size() == 3) {
+        CHECK((*program)[0].address == 0x42);
+        CHECK((*program)[1].address == 0x1F);
+        CHECK((*program)[2].address == 0xA0);
+    }
+}
+
+TEST(printTakesAMessageAVariableOrBoth) {
+    std::optional<std::vector<Instruction>> program = parseProgram("PRINT(\"hi\"); PRINT(x); PRINT(\"x is \"+x)");
+    CHECK(program.has_value() && program->size() == 3);
+    if (program && program->size() == 3) {
+        const std::vector<Instruction>& p = *program;
+        CHECK(p[0].message == "hi" && p[0].variable.empty());
+        CHECK(p[1].message.empty() && p[1].variable == "x");
+        CHECK(p[2].message == "x is " && p[2].variable == "x");
+    }
+}
+
+TEST(parsesForLoops) {
+    std::optional<std::vector<Instruction>> program = parseProgram("FOR([PRINT(\"hi\"); ADD x x 1], 3)");
+    CHECK(program.has_value() && program->size() == 1);
+    if (!program || program->size() != 1) {
+        return;
+    }
+    const Instruction& loop = (*program)[0];
+    CHECK(loop.type == InstructionType::FOR && loop.repeats == 3 && loop.body.size() == 2);
+    if (loop.body.size() == 2) {
+        CHECK(loop.body[0].type == InstructionType::PRINT && loop.body[0].message == "hi");
+        CHECK(loop.body[1].type == InstructionType::ADD && isVariable(loop.body[1].first, "x") &&
+              isLiteral(loop.body[1].second, 1));
+    }
+    CHECK(executedCount(loop) == 6);
+}
+
+TEST(forLoopsNestAtMostThreeDeep) {
+    CHECK(parseProgram("FOR([FOR([FOR([PRINT(\"deep\")], 2)], 2)], 2)").has_value());
+    CHECK(!parseProgram("FOR([FOR([FOR([FOR([PRINT(\"deep\")], 2)], 2)], 2)], 2)").has_value());
+}
+
+TEST(rejectsLoopsThatRunNothing) {
+    CHECK(!parseProgram("FOR([], 3)").has_value());
+    CHECK(!parseProgram("FOR([PRINT(\"hi\")], 0)").has_value());
+}
+
+TEST(programsHaveOneToFiftyStatements) {
+    CHECK(!parseProgram("").has_value());
+    CHECK(!parseProgram("  ;  ").has_value());
+    CHECK(parseProgram(repeated("SLEEP 1", 1)).has_value());
+    CHECK(parseProgram(repeated("SLEEP 1", 50)).has_value());
+    CHECK(!parseProgram(repeated("SLEEP 1", 51)).has_value());
+}
+
+TEST(literalsClampToUint16) {
+    std::optional<std::vector<Instruction>> program =
+        parseProgram("DECLARE x 70000; DECLARE y -5; ADD z 99999999999999999999 1; SLEEP 300");
+    CHECK(program.has_value() && program->size() == 4);
+    if (program && program->size() == 4) {
+        const std::vector<Instruction>& p = *program;
+        CHECK(p[0].first.value == 65535);
+        CHECK(p[1].first.value == 0);
+        CHECK(isLiteral(p[2].first, 65535));
+        CHECK(p[3].sleepTicks == 255);
+    }
+}
+
+TEST(rejectsInvalidStatements) {
+    CHECK(!parseProgram("FOO 1").has_value());
+    CHECK(!parseProgram("READ x zz").has_value());
+    CHECK(!parseProgram("PRINT(unterminated").has_value());
+    CHECK(!parseProgram("PRINT(\"unterminated)").has_value());
+    CHECK(!parseProgram("DECLARE x").has_value());
+    CHECK(!parseProgram("DECLARE 5 x").has_value());
+    CHECK(!parseProgram("ADD x y").has_value());
+    CHECK(!parseProgram("WRITE 0x10 1 2").has_value());
+    CHECK(!parseProgram("SLEEP 1; FOO 2").has_value());
+}
+
+TEST(ignoresATrailingSemicolon) {
+    std::optional<std::vector<Instruction>> program = parseProgram("DECLARE x 1; PRINT(\"done\");");
+    CHECK(program.has_value() && program->size() == 2);
+}
+
+TEST(semicolonsInsideQuotesDoNotSplit) {
+    std::optional<std::vector<Instruction>> program = parseProgram("PRINT(\"a; b\"); SLEEP 1");
+    CHECK(program.has_value() && program->size() == 2);
+    if (program && program->size() == 2) {
+        CHECK((*program)[0].message == "a; b");
+    }
+}
+
+TEST(keywordsIgnoreCase) {
+    std::optional<std::vector<Instruction>> program =
+        parseProgram("declare x 1; Print(\"v\" + x); write 0x40 x; Read y 0x40; for([sleep 1], 2)");
+    CHECK(program.has_value() && program->size() == 5);
+    if (program && program->size() == 5) {
+        const std::vector<Instruction>& p = *program;
+        CHECK(p[0].type == InstructionType::DECLARE);
+        CHECK(p[1].type == InstructionType::PRINT);
+        CHECK(p[2].type == InstructionType::WRITE);
+        CHECK(p[3].type == InstructionType::READ);
+        CHECK(p[4].type == InstructionType::FOR);
+    }
+}
+
+TEST(screenCreateArgumentsWithoutASize) {
+    std::optional<ScreenCreateArgs> args = parseScreenCreate("process2 \"DECLARE x 1\"");
+    CHECK(args.has_value());
+    if (args) {
+        CHECK(args->name == "process2");
+        CHECK(args->sizeText.empty());
+        CHECK(args->instructions == "DECLARE x 1");
+    }
+}
+
+TEST(screenCreateArgumentsWithASize) {
+    std::optional<ScreenCreateArgs> args = parseScreenCreate("p 256 \"SLEEP 1\"");
+    CHECK(args.has_value() && args->name == "p" && args->sizeText == "256" && args->instructions == "SLEEP 1");
+    std::optional<ScreenCreateArgs> empty = parseScreenCreate("q 256 \"\"");
+    CHECK(empty.has_value() && empty->instructions.empty());
+}
+
+TEST(screenCreateUnescapesQuotes) {
+    std::optional<ScreenCreateArgs> args =
+        parseScreenCreate("process2 \"DECLARE varA 10; DECLARE varB 5; ADD varA varA varB; WRITE 0x500 varA; "
+                          "READ varC 0x500; PRINT(\\\"Result: \\\" + varC)\"");
+    CHECK(args.has_value() && args->instructions == kSpecProgram);
+}
+
+TEST(screenCreateNeedsQuotedInstructions) {
+    CHECK(!parseScreenCreate("").has_value());
+    CHECK(!parseScreenCreate("p").has_value());
+    CHECK(!parseScreenCreate("p 256").has_value());
+    CHECK(!parseScreenCreate("p 256 SLEEP 1").has_value());
+    CHECK(!parseScreenCreate("p \"SLEEP 1\" extra").has_value());
 }
 
 // ---- Process ----
