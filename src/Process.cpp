@@ -91,6 +91,9 @@ StepResult Process::step(int core, MemoryManager& memory) {
 }
 
 bool Process::execute(const Instruction& instruction, int core, MemoryManager& memory) {
+    if (overfillsSymbolTable(instruction)) {
+        return true; // ignored: it would declare a variable, but the symbol table is full
+    }
     switch (instruction.type) {
     case InstructionType::PRINT: {
         std::string text = instruction.message;
@@ -244,6 +247,39 @@ void Process::enterLoop(const Instruction& loop) {
 bool Process::isValidAddress(uint64_t address) const {
     // The whole uint16, at address and address + 1, must be inside the process's memory.
     return memoryBytes >= 2 && address <= memoryBytes - 2;
+}
+
+bool Process::overfillsSymbolTable(const Instruction& instruction) const {
+    // The variables the instruction uses (undeclared ones are declared as 0 when used).
+    std::vector<std::string> used;
+    switch (instruction.type) {
+    case InstructionType::PRINT:
+    case InstructionType::DECLARE:
+    case InstructionType::READ:
+        used.push_back(instruction.variable);
+        break;
+    case InstructionType::ADD:
+    case InstructionType::SUBTRACT:
+        used.push_back(instruction.variable);
+        used.push_back(instruction.first.isVariable ? instruction.first.variable : "");
+        used.push_back(instruction.second.isVariable ? instruction.second.variable : "");
+        break;
+    case InstructionType::WRITE:
+        used.push_back(instruction.first.isVariable ? instruction.first.variable : "");
+        break;
+    case InstructionType::SLEEP:
+    case InstructionType::FOR:
+        break;
+    }
+
+    std::vector<std::string> added;
+    for (const std::string& variable : used) {
+        if (!variable.empty() && std::find(symbols.begin(), symbols.end(), variable) == symbols.end() &&
+            std::find(added.begin(), added.end(), variable) == added.end()) {
+            added.push_back(variable);
+        }
+    }
+    return symbols.size() + added.size() > kMaxVariables;
 }
 
 std::optional<size_t> Process::slotOf(const std::string& variable, MemoryManager& memory) {

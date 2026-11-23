@@ -116,7 +116,9 @@ void Scheduler::tick() {
         }
     }
 
-    memory.flush();
+    if (cpuTicks % kTicksPerBackingStoreWrite == 0) {
+        memory.flush();
+    }
     ++cpuTicks;
 }
 

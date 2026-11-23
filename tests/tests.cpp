@@ -1,4 +1,4 @@
-// Unit tests for the CSOPESY emulator. How to build and run them: see handover.txt.
+// Unit tests for the CSOPESY emulator.
 // Usage, from the repo root: msbuild tests\CSOPESY.Tests.vcxproj /p:Configuration=Debug /p:Platform=x64,
 // then run tests\x64\Debug\CSOPESY.Tests.exe. Expect "0 failures".
 
@@ -317,6 +317,16 @@ TEST(acceptsMaxMemProcSpelling) {
     std::string error;
     CHECK(parse("min-mem-per-proc 64 max-mem-proc 128", config, error));
     CHECK(config.maxMemPerProc == 128);
+}
+
+TEST(parsesTypedMemorySizes) {
+    CHECK(parseMemorySize("256") == std::optional<uint64_t>(256));
+    CHECK(parseMemorySize("65536") == std::optional<uint64_t>(65536));
+    CHECK(!parseMemorySize("100").has_value());
+    CHECK(!parseMemorySize("131072").has_value());
+    CHECK(!parseMemorySize("abc").has_value());
+    CHECK(!parseMemorySize("").has_value());
+    CHECK(!parseMemorySize("99999999999999999999999").has_value());
 }
 
 TEST(memorySizesArePowersOfTwoFrom64To65536) {
@@ -1138,8 +1148,14 @@ TEST(theSymbolTableHoldsThirtyTwoVariables) {
     CHECK(loaded.process.variableCount() == 32);
     CHECK(!loaded.process.variable("v32", loaded.memory).has_value());
     CHECK(loaded.has("v0", 1) && loaded.has("v31", 32));
-    loaded.run(makeArithmetic(InstructionType::ADD, "v31", variableOperand("v32"), literal(1)));
-    CHECK(loaded.has("v31", 1)); // v32 can't be declared, so it reads as 0
+    // Any instruction that would declare a 33rd variable is ignored as a whole.
+    CHECK(loaded.run(makeArithmetic(InstructionType::ADD, "v31", variableOperand("v32"), literal(1))));
+    CHECK(loaded.has("v31", 32));
+    CHECK(loaded.run(makePrint("v32 = ", "v32")));
+    CHECK(loaded.process.getLogs().empty());
+    // Instructions that only use declared variables still run.
+    CHECK(loaded.run(makeArithmetic(InstructionType::ADD, "v31", variableOperand("v31"), literal(1))));
+    CHECK(loaded.has("v31", 33));
 }
 
 TEST(ignoredDeclarationsStillCountAsExecuted) {
@@ -1653,10 +1669,8 @@ TEST(processesFinishWhenMemoryIsScarce) {
                                       {makeDeclare("x", 7), makeWrite(0x80, variableOperand("x")), makeRead("y", 0x80),
                                        makePrint("y = ", "y")}));
     }
-    bool storeUsed = false;
     for (int i = 0; i < 5000 && scheduler.utilization().finished.size() < 3; ++i) {
         scheduler.tick();
-        storeUsed = storeUsed || fileLines(kSchedulerStore).size() > 1;
     }
     CHECK(scheduler.utilization().finished.size() == 3);
     for (const char* name : names) {
@@ -1666,7 +1680,27 @@ TEST(processesFinishWhenMemoryIsScarce) {
     MemoryReport report = scheduler.memoryReport();
     CHECK(report.pagedOut > 0 && report.pagedIn > report.pagedOut);
     CHECK(report.usedBytes == 0);
-    CHECK(storeUsed);
+}
+
+TEST(backingStoreFileIsRewrittenEveryTwentyTicks) {
+    // 1 frame of 64 bytes: the WRITE to page 1 (tick 4) evicts page 0, which holds x = 1.
+    Config config = testConfig(1, SchedulerType::FCFS, 5, 1, 1, 0);
+    config.maxOverallMem = 64;
+    config.memPerFrame = 64;
+    Scheduler scheduler(config, 1, kSchedulerStore);
+    std::vector<Instruction> program = {makeDeclare("x", 1), makeWrite(0x40, literal(5))};
+    for (int i = 0; i < 30; ++i) {
+        program.push_back(makePrint("waiting"));
+    }
+    CHECK(scheduler.createProcess("a", 128, program));
+    for (uint64_t i = 0; i < kTicksPerBackingStoreWrite; ++i) {
+        scheduler.tick();
+    }
+    CHECK(scheduler.memoryReport().pagedOut == 1);
+    CHECK(fileLines(kSchedulerStore).size() == 1); // evicted, but the file isn't due yet
+    scheduler.tick();                              // tick 21 rewrites the file
+    std::vector<std::string> lines = fileLines(kSchedulerStore);
+    CHECK(lines.size() == 2 && lines[1].rfind("a (ID 1) page 0: 01 00 ", 0) == 0);
 }
 
 TEST(memoryAccessViolationShutsTheProcessDown) {

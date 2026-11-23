@@ -74,7 +74,7 @@ run 'num-cpu 2 scheduler "FCFS" quantum-cycles 3 batch-process-freq 4 min-ins 5 
 expect "config variants" "^Initialized: num-cpu 2, scheduler fcfs, quantum-cycles 3, batch-process-freq 4, min-ins 5, max-ins 6, delay-per-exec 7, $MEMORY_DEFAULTS\$"
 
 # screen -s, process-smi, Finished!, then the finished process can't be opened again.
-run "$QUICK" "echo initialize; echo 'screen -s A 256'; sleep 3; echo process-smi; echo exit; echo 'screen -r A'; echo 'screen -s A 256'; echo exit"
+run "$QUICK" "echo initialize; echo 'screen -s A 256'; sleep 5; echo process-smi; echo exit; echo 'screen -r A'; echo 'screen -s A 256'; echo exit"
 expect "process name" '^Process name: A$'
 expect "process id" '^ID: 1$'
 expect "logs header" '^Logs:$'

@@ -1,7 +1,6 @@
 #include "Console.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -46,16 +45,6 @@ std::string formatPercent(uint64_t used, uint64_t total) {
     std::ostringstream text;
     text << std::fixed << std::setprecision(2) << static_cast<double>(used) * 100.0 / static_cast<double>(total) << "%";
     return text.str();
-}
-
-// A memory size typed by the user, or nullopt if it isn't a power of 2 from 64 to 65536.
-std::optional<uint64_t> parseMemorySize(const std::string& text) {
-    bool digitsOnly = !text.empty() && text.size() <= 19 &&
-                      std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
-    if (!digitsOnly || !isValidMemorySize(std::stoull(text))) {
-        return std::nullopt;
-    }
-    return std::stoull(text);
 }
 
 // screen -r's message for a process shut down by a memory access violation.

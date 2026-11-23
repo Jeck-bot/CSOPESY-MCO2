@@ -25,6 +25,10 @@
 // delay Y in [1, 5]) must go idle between processes. Counting in raw ticks makes both impossible.
 constexpr uint64_t kTicksPerBatchCycle = 20;
 
+// The backing store file is rewritten at most once every this many ticks (200 ms). Rewriting the
+// whole file on every tick of heavy paging would slow the ticks and the console down.
+constexpr uint64_t kTicksPerBackingStoreWrite = 20;
+
 // One row of screen -ls: a process on a core, or a finished process (core is -1). A process that
 // crashed shows the instructions it executed before the crash.
 struct ProcessRow {

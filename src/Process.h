@@ -53,7 +53,8 @@ public:
     // when it accessed an address outside the process's memory, which shuts the process down.
     StepResult step(int core, MemoryManager& memory);
 
-    // Executes one instruction other than FOR. Returns false on a memory access violation.
+    // Executes one instruction other than FOR. An instruction that would declare a variable while
+    // the symbol table is full is ignored. Returns false on a memory access violation.
     bool execute(const Instruction& instruction, int core, MemoryManager& memory);
 
     // The value of a variable in the symbol table, or nullopt if it isn't there. Page 0 must be
@@ -88,6 +89,7 @@ private:
     const Instruction& nextInstruction();
     void enterLoop(const Instruction& loop);
     bool isValidAddress(uint64_t address) const;
+    bool overfillsSymbolTable(const Instruction& instruction) const;
     std::optional<size_t> slotOf(const std::string& variable, MemoryManager& memory);
     uint16_t load(const std::string& variable, MemoryManager& memory);
     void store(const std::string& variable, uint16_t value, MemoryManager& memory);

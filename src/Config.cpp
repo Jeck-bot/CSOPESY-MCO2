@@ -30,10 +30,10 @@ bool parseNumber(const std::string& key, const std::string& text, uint64_t low, 
     return false;
 }
 
-// Parses a memory size (see isValidMemorySize) into value.
-bool parseMemorySize(const std::string& key, const std::string& text, uint64_t& value, std::string& error) {
-    if (isSmallNumber(text) && isValidMemorySize(std::stoull(text))) {
-        value = std::stoull(text);
+// Reads the memory size for key (see isValidMemorySize) into value.
+bool readMemorySize(const std::string& key, const std::string& text, uint64_t& value, std::string& error) {
+    if (std::optional<uint64_t> bytes = parseMemorySize(text)) {
+        value = *bytes;
         return true;
     }
     error = "Invalid " + key + " \"" + text + "\": must be a power of 2 from 64 to 65536.";
@@ -51,6 +51,13 @@ std::string withoutQuotes(const std::string& text) {
 
 bool isValidMemorySize(uint64_t bytes) {
     return bytes >= 64 && bytes <= 65536 && (bytes & (bytes - 1)) == 0;
+}
+
+std::optional<uint64_t> parseMemorySize(const std::string& text) {
+    if (!isSmallNumber(text) || !isValidMemorySize(std::stoull(text))) {
+        return std::nullopt;
+    }
+    return std::stoull(text);
 }
 
 bool parseConfig(std::istream& input, Config& config, std::string& error) {
@@ -102,20 +109,20 @@ bool parseConfig(std::istream& input, Config& config, std::string& error) {
                 return false;
             }
         } else if (key == "max-overall-mem") {
-            if (!parseMemorySize(key, value, result.maxOverallMem, error)) {
+            if (!readMemorySize(key, value, result.maxOverallMem, error)) {
                 return false;
             }
         } else if (key == "mem-per-frame") {
-            if (!parseMemorySize(key, value, result.memPerFrame, error)) {
+            if (!readMemorySize(key, value, result.memPerFrame, error)) {
                 return false;
             }
         } else if (key == "min-mem-per-proc") {
-            if (!parseMemorySize(key, value, result.minMemPerProc, error)) {
+            if (!readMemorySize(key, value, result.minMemPerProc, error)) {
                 return false;
             }
         } else if (key == "max-mem-per-proc" || key == "max-mem-proc") {
             // The spec's table names it "max-mem-per-proc"; its description calls it "max-mem-proc".
-            if (!parseMemorySize(key, value, result.maxMemPerProc, error)) {
+            if (!readMemorySize(key, value, result.maxMemPerProc, error)) {
                 return false;
             }
         }
