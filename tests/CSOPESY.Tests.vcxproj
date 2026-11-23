@@ -43,6 +43,7 @@
     <ClCompile Include="..\src\Config.cpp" />
     <ClCompile Include="..\src\Instruction.cpp" />
     <ClCompile Include="..\src\InstructionParser.cpp" />
+    <ClCompile Include="..\src\MemoryManager.cpp" />
     <ClCompile Include="..\src\Process.cpp" />
     <ClCompile Include="..\src\Scheduler.cpp" />
     <ClCompile Include="..\src\Utils.cpp" />

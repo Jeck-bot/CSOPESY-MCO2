@@ -23,6 +23,7 @@
 #include "../src/Config.h"
 #include "../src/Instruction.h"
 #include "../src/InstructionParser.h"
+#include "../src/MemoryManager.h"
 #include "../src/Process.h"
 #include "../src/Scheduler.h"
 #include "../src/Utils.h"
@@ -844,6 +845,120 @@ TEST(backingStoreFlushSkipsTheFileWhenNothingChanged) {
     store.flush(); // nothing changed since the last flush, so the marker stays
     std::vector<std::string> lines = fileLines(kStorePath);
     CHECK(!lines.empty() && lines.back() == "marker");
+    std::remove(kStorePath.c_str());
+}
+
+// ---- Memory manager ----
+// Most tests use 256 bytes of memory in 64-byte frames: 4 frames.
+
+TEST(freshPagesReadZero) {
+    MemoryManager memory(256, 64, kStorePath);
+    memory.allocate(1, "p", 256);
+    CHECK(memory.isAllocated(1) && !memory.isAllocated(2));
+    CHECK(!memory.isResident(1, 0));
+    CHECK(memory.pageIn(1, {0}));
+    CHECK(memory.isResident(1, 0));
+    CHECK(memory.read16(1, 10) == 0);
+    CHECK(memory.pagedIn() == 1 && memory.pagedOut() == 0);
+}
+
+TEST(write16RoundTripsLittleEndianAcrossPages) {
+    MemoryManager memory(256, 64, kStorePath);
+    memory.allocate(1, "p", 256);
+    CHECK(memory.pageIn(1, {0, 1}));
+    memory.write16(1, 10, 0x1234);
+    CHECK(memory.read16(1, 10) == 0x1234);
+    memory.write16(1, 63, 0xABCD); // low byte at 63 (page 0), high byte at 64 (page 1)
+    CHECK(memory.read16(1, 63) == 0xABCD);
+    CHECK(memory.read16(1, 64) == 0x00AB);
+    CHECK(memory.read16(1, 62) == 0xCD00);
+}
+
+TEST(fullMemoryEvictsTheOldestPageToTheBackingStore) {
+    MemoryManager memory(256, 64, kStorePath);
+    memory.allocate(1, "p01", 512);
+    for (uint64_t page = 0; page < 4; ++page) {
+        CHECK(memory.pageIn(1, {page}));
+        memory.unpin(1);
+    }
+    memory.write16(1, 0, 42);
+    CHECK(memory.pageIn(1, {4}));
+    CHECK(!memory.isResident(1, 0));
+    CHECK(memory.isResident(1, 1) && memory.isResident(1, 4));
+    CHECK(memory.pagedOut() == 1);
+    memory.flush();
+    std::vector<std::string> lines = fileLines(kStorePath);
+    CHECK(lines.size() == 2 && lines[1].rfind("p01 (ID 1) page 0: 2a 00 ", 0) == 0);
+
+    memory.unpin(1);
+    CHECK(memory.pageIn(1, {0})); // evicts page 1, now the oldest
+    CHECK(memory.read16(1, 0) == 42);
+    CHECK(!memory.isResident(1, 1));
+    CHECK(memory.pagedIn() == 6 && memory.pagedOut() == 2);
+}
+
+TEST(pinnedPagesAreNeverEvicted) {
+    MemoryManager memory(256, 64, kStorePath);
+    memory.allocate(1, "a", 256);
+    memory.allocate(2, "b", 512);
+    CHECK(memory.pageIn(1, {0, 1}));
+    CHECK(memory.pageIn(2, {0, 1}));
+    CHECK(!memory.pageIn(2, {2})); // every frame is pinned
+    CHECK(memory.residentBytes(2) == 128 && !memory.isResident(2, 2));
+    memory.unpin(1);
+    CHECK(memory.pageIn(2, {2})); // evicts a's oldest page
+    CHECK(!memory.isResident(1, 0) && memory.isResident(1, 1));
+}
+
+TEST(pageInIsAllOrNothing) {
+    MemoryManager memory(256, 64, kStorePath);
+    memory.allocate(1, "a", 256);
+    memory.allocate(2, "b", 512);
+    CHECK(memory.pageIn(1, {0, 1, 2}));
+    CHECK(!memory.pageIn(2, {0, 1})); // needs two frames; only one is free
+    CHECK(memory.residentBytes(2) == 0 && memory.pagedIn() == 3);
+    CHECK(memory.pageIn(2, {0}));
+}
+
+TEST(pageInKeepsTheInstructionsOtherPages) {
+    MemoryManager memory(128, 64, kStorePath); // 2 frames
+    memory.allocate(1, "a", 256);
+    CHECK(memory.pageIn(1, {0}));
+    memory.unpin(1);
+    CHECK(memory.pageIn(1, {1}));
+    memory.unpin(1);
+    CHECK(memory.pageIn(1, {0, 2})); // evicts page 1, not page 0, the oldest
+    CHECK(memory.isResident(1, 0) && memory.isResident(1, 2) && !memory.isResident(1, 1));
+}
+
+TEST(usedMemoryFollowsLoadedPages) {
+    MemoryManager memory(256, 64, kStorePath);
+    CHECK(memory.totalBytes() == 256 && memory.frameBytes() == 64 && memory.usedBytes() == 0);
+    memory.allocate(1, "a", 256);
+    memory.allocate(2, "b", 64);
+    CHECK(memory.usedBytes() == 0);
+    CHECK(memory.pageIn(1, {0, 3}));
+    CHECK(memory.pageIn(2, {0}));
+    CHECK(memory.usedBytes() == 192);
+    CHECK(memory.residentBytes(1) == 128 && memory.residentBytes(2) == 64 && memory.residentBytes(3) == 0);
+}
+
+TEST(releaseFreesFramesAndSavedPages) {
+    MemoryManager memory(128, 64, kStorePath);
+    memory.allocate(1, "a", 256);
+    CHECK(memory.pageIn(1, {0, 1}));
+    memory.unpin(1);
+    CHECK(memory.pageIn(1, {2})); // evicts page 0
+    memory.flush();
+    CHECK(fileLines(kStorePath).size() == 2);
+    memory.release(1);
+    memory.flush();
+    CHECK(!memory.isAllocated(1));
+    CHECK(memory.usedBytes() == 0);
+    CHECK(fileLines(kStorePath).size() == 1);
+    memory.allocate(2, "b", 128);
+    CHECK(memory.pageIn(2, {0, 1})); // both frames are free again
+    CHECK(memory.pagedOut() == 1);
     std::remove(kStorePath.c_str());
 }
 
