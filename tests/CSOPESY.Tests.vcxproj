@@ -39,6 +39,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="tests.cpp" />
+    <ClCompile Include="..\src\BackingStore.cpp" />
     <ClCompile Include="..\src\Config.cpp" />
     <ClCompile Include="..\src\Instruction.cpp" />
     <ClCompile Include="..\src\InstructionParser.cpp" />

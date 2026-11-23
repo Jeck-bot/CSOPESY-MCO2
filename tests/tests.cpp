@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <optional>
@@ -18,6 +19,7 @@
 
 // Included by path: putting src/ on the include path would make <thread>'s <process.h> resolve to
 // Process.h, since Windows file names are case-insensitive.
+#include "../src/BackingStore.h"
 #include "../src/Config.h"
 #include "../src/Instruction.h"
 #include "../src/InstructionParser.h"
@@ -758,6 +760,91 @@ TEST(screenCreateNeedsQuotedInstructions) {
     CHECK(!parseScreenCreate("p 256").has_value());
     CHECK(!parseScreenCreate("p 256 SLEEP 1").has_value());
     CHECK(!parseScreenCreate("p \"SLEEP 1\" extra").has_value());
+}
+
+// ---- Backing store ----
+
+namespace {
+
+// A path in the temp folder, so tests don't leave files in the repo.
+std::string tempPath(const std::string& name) {
+    return (std::filesystem::temp_directory_path() / name).string();
+}
+
+std::vector<std::string> fileLines(const std::string& path) {
+    std::ifstream file(path);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(file, line)) {
+        lines.push_back(line);
+    }
+    return lines;
+}
+
+const std::string kStorePath = tempPath("csopesy-test-backing-store.txt");
+
+}  // namespace
+
+TEST(backingStoreCreatesItsFile) {
+    std::remove(kStorePath.c_str());
+    BackingStore store(kStorePath);
+    std::vector<std::string> lines = fileLines(kStorePath);
+    CHECK(lines.size() == 1 && lines[0] == kBackingStoreHeader);
+}
+
+TEST(backingStoreWritesStoredPagesOnFlush) {
+    BackingStore store(kStorePath);
+    std::vector<uint8_t> bytes(64, 0);
+    bytes[0] = 10;
+    store.store(1, "p01", 2, bytes);
+    CHECK(fileLines(kStorePath).size() == 1); // written only by flush
+    store.flush();
+    std::string expected = "p01 (ID 1) page 2: 0a";
+    for (int i = 1; i < 64; ++i) {
+        expected += " 00";
+    }
+    std::vector<std::string> lines = fileLines(kStorePath);
+    CHECK(lines.size() == 2 && lines[1] == expected);
+    CHECK(store.pageCount() == 1);
+}
+
+TEST(backingStoreTakeReturnsAndRemovesThePage) {
+    BackingStore store(kStorePath);
+    store.store(1, "p01", 2, {1, 2, 255});
+    store.flush();
+    std::optional<std::vector<uint8_t>> page = store.take(1, 2);
+    CHECK(page.has_value() && *page == std::vector<uint8_t>({1, 2, 255}));
+    CHECK(!store.take(1, 2).has_value());
+    CHECK(!store.take(9, 0).has_value());
+    store.flush();
+    CHECK(fileLines(kStorePath).size() == 1);
+    CHECK(store.pageCount() == 0);
+}
+
+TEST(backingStoreRemovesAllPagesOfAProcess) {
+    BackingStore store(kStorePath);
+    store.store(1, "a", 0, {1});
+    store.store(1, "a", 5, {2});
+    store.store(2, "b", 0, {3});
+    store.removeProcess(1);
+    store.flush();
+    std::vector<std::string> lines = fileLines(kStorePath);
+    CHECK(lines.size() == 2 && lines[1] == "b (ID 2) page 0: 03");
+    CHECK(store.pageCount() == 1);
+}
+
+TEST(backingStoreFlushSkipsTheFileWhenNothingChanged) {
+    BackingStore store(kStorePath);
+    store.store(1, "a", 0, {1});
+    store.flush();
+    {
+        std::ofstream file(kStorePath, std::ios::app);
+        file << "marker\n";
+    }
+    store.flush(); // nothing changed since the last flush, so the marker stays
+    std::vector<std::string> lines = fileLines(kStorePath);
+    CHECK(!lines.empty() && lines.back() == "marker");
+    std::remove(kStorePath.c_str());
 }
 
 // ---- Process ----

@@ -73,6 +73,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\BackingStore.cpp" />
     <ClCompile Include="src\Config.cpp" />
     <ClCompile Include="src\Console.cpp" />
     <ClCompile Include="src\Instruction.cpp" />
@@ -82,6 +83,7 @@
     <ClCompile Include="src\Utils.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\BackingStore.h" />
     <ClInclude Include="src\Config.h" />
     <ClInclude Include="src\Console.h" />
     <ClInclude Include="src\Instruction.h" />
