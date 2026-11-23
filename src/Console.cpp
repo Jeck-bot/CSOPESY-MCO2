@@ -1,21 +1,27 @@
 #include "Console.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <sstream>
+#include <utility>
 #include <vector>
 
+#include "InstructionParser.h"
 #include "Utils.h"
 
 namespace {
 
 const char* const kPrompt = "root:\\> ";
 const char* const kDivider = "----------------------------------------";
+const char* const kSmiDivider = "--------------------------------------------"; // as wide as process-smi's title box
 
 void clearScreen() {
     std::system("cls");
@@ -33,12 +39,34 @@ std::string textAfterWords(const std::string& line, size_t count) {
 }
 
 // "100%" when the share is whole, otherwise two decimals, e.g. "66.67%".
-std::string formatPercent(uint32_t used, uint32_t total) {
+std::string formatPercent(uint64_t used, uint64_t total) {
     if (used * 100 % total == 0) {
         return std::to_string(used * 100 / total) + "%";
     }
     std::ostringstream text;
-    text << std::fixed << std::setprecision(2) << used * 100.0 / total << "%";
+    text << std::fixed << std::setprecision(2) << static_cast<double>(used) * 100.0 / static_cast<double>(total) << "%";
+    return text.str();
+}
+
+// A memory size typed by the user, or nullopt if it isn't a power of 2 from 64 to 65536.
+std::optional<uint64_t> parseMemorySize(const std::string& text) {
+    bool digitsOnly = !text.empty() && text.size() <= 19 &&
+                      std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+    if (!digitsOnly || !isValidMemorySize(std::stoull(text))) {
+        return std::nullopt;
+    }
+    return std::stoull(text);
+}
+
+// screen -r's message for a process shut down by a memory access violation.
+std::string violationMessage(const ProcessView& process) {
+    std::tm local{};
+    localtime_s(&local, &process.crashedAt);
+    char clock[16];
+    std::strftime(clock, sizeof(clock), "%H:%M:%S", &local);
+    std::ostringstream text;
+    text << "Process " << process.name << " shut down due to memory access violation error that occurred at "
+         << clock << ". 0x" << std::uppercase << std::hex << process.faultAddress << " invalid.";
     return text.str();
 }
 
@@ -100,19 +128,32 @@ bool Console::handleCommand(const std::string& line) {
     std::string option = words.size() > 1 ? toLower(words[1]) : "";
     if (command == "initialize") {
         std::cout << "Already initialized.\n";
-    } else if (command == "screen" && (option == "-s" || option == "-r")) {
+    } else if (command == "screen" && option == "-s") {
+        if (words.size() == 4) {
+            return screenCreate(words[2], words[3]);
+        }
+        if (words.size() == 3) {
+            return screenOpen(words[2]);
+        }
+        std::cout << "Usage: screen -s <process name> <memory size>\n";
+    } else if (command == "screen" && option == "-c") {
+        return screenCreateProgram(textAfterWords(line, 2));
+    } else if (command == "screen" && option == "-r") {
         std::string name = textAfterWords(line, 2);
         if (name.empty()) {
-            std::cout << "Usage: screen " << option << " <process name>\n";
-        } else if (option == "-s") {
-            return screenCreate(name);
+            std::cout << "Usage: screen -r <process name>\n";
         } else {
             return screenResume(name);
         }
     } else if ((command == "screen" && option == "-ls") || command == "screen-ls") {
         screenList();
     } else if (command == "screen") {
-        std::cout << "Usage: screen -s <process name> | screen -r <process name> | screen -ls\n";
+        std::cout << "Usage: screen -s <process name> <memory size> | screen -c <process name> [<memory size>] "
+                     "\"<instructions>\" | screen -r <process name> | screen -ls\n";
+    } else if (command == "process-smi") {
+        processSmi();
+    } else if (command == "vmstat") {
+        vmstat();
     } else if (command == "scheduler-start" || command == "scheduler-test") {
         // "scheduler-test" is the command's former name in the spec.
         std::cout << (scheduler->startBatchGeneration() ? "Scheduler started generating processes.\n"
@@ -140,10 +181,17 @@ void Console::initialize() {
     std::cout << "Initialized: num-cpu " << config.numCpu << ", scheduler "
               << (config.scheduler == SchedulerType::RR ? "rr" : "fcfs") << ", quantum-cycles "
               << config.quantumCycles << ", batch-process-freq " << config.batchProcessFreq << ", min-ins "
-              << config.minIns << ", max-ins " << config.maxIns << ", delay-per-exec " << config.delayPerExec << "\n";
+              << config.minIns << ", max-ins " << config.maxIns << ", delay-per-exec " << config.delayPerExec
+              << ", max-overall-mem " << config.maxOverallMem << ", mem-per-frame " << config.memPerFrame
+              << ", min-mem-per-proc " << config.minMemPerProc << ", max-mem-per-proc " << config.maxMemPerProc << "\n";
 }
 
-bool Console::screenCreate(const std::string& name) {
+bool Console::screenCreate(const std::string& name, const std::string& size) {
+    std::optional<uint64_t> memoryBytes = parseMemorySize(size);
+    if (!memoryBytes) {
+        std::cout << "invalid memory allocation\n";
+        return true;
+    }
     std::optional<ProcessView> existing = scheduler->view(name);
     if (existing && existing->finished) {
         std::cout << "Process " << name << " already exists.\n";
@@ -152,13 +200,54 @@ bool Console::screenCreate(const std::string& name) {
     // A name that is still running opens that process: the spec has users open processes made
     // by scheduler-start with "screen -s <process name>".
     if (!existing) {
-        scheduler->createProcess(name, scheduler->rollMemorySize());
+        scheduler->createProcess(name, *memoryBytes);
     }
     return attach(name);
 }
 
+bool Console::screenOpen(const std::string& name) {
+    std::optional<ProcessView> existing = scheduler->view(name);
+    if (existing && !existing->finished) {
+        return attach(name);
+    }
+    if (existing) {
+        std::cout << "Process " << name << " already exists.\n";
+    } else {
+        std::cout << "Usage: screen -s <process name> <memory size>\n";
+    }
+    return true;
+}
+
+bool Console::screenCreateProgram(const std::string& arguments) {
+    std::optional<ScreenCreateArgs> args = parseScreenCreate(arguments);
+    if (!args) {
+        std::cout << "invalid command\n";
+        return true;
+    }
+    std::optional<uint64_t> memoryBytes =
+        args->sizeText.empty() ? std::optional<uint64_t>(scheduler->rollMemorySize()) : parseMemorySize(args->sizeText);
+    if (!memoryBytes) {
+        std::cout << "invalid memory allocation\n";
+        return true;
+    }
+    std::optional<std::vector<Instruction>> program = parseProgram(args->instructions);
+    if (!program) {
+        std::cout << "invalid command\n";
+        return true;
+    }
+    if (!scheduler->createProcess(args->name, *memoryBytes, std::move(*program))) {
+        std::cout << "Process " << args->name << " already exists.\n";
+        return true;
+    }
+    return attach(args->name);
+}
+
 bool Console::screenResume(const std::string& name) {
     std::optional<ProcessView> process = scheduler->view(name);
+    if (process && process->crashed) {
+        std::cout << violationMessage(*process) << "\n";
+        return true;
+    }
     if (!process || process->finished) {
         std::cout << "Process " << name << " not found.\n";
         return true;
@@ -214,7 +303,9 @@ void Console::printProcessInfo(const ProcessView& process) const {
         std::cout << "(" << formatTimestamp(log.time) << ") Core:" << log.core << " \"" << log.text << "\"\n";
     }
     std::cout << "\n";
-    if (process.finished) {
+    if (process.crashed) {
+        std::cout << violationMessage(process) << "\n";
+    } else if (process.finished) {
         std::cout << "Finished!\n";
     } else {
         std::cout << "Current instruction line: " << process.executed << "\n"
@@ -249,8 +340,45 @@ std::string Console::utilizationReport() const {
          << "Finished processes:\n";
     for (const ProcessRow& row : usage.finished) {
         text << std::setw(nameColumn) << row.name << "(" << formatTimestamp(row.createdAt) << ")  Finished  "
-             << row.total << " / " << row.total << "\n";
+             << row.executed << " / " << row.total << "\n";
     }
     text << kDivider << "\n";
     return text.str();
+}
+
+void Console::processSmi() const {
+    MemoryReport report = scheduler->memoryReport();
+    std::cout << "\n"
+              << kSmiDivider << "\n"
+              << "| PROCESS-SMI V01.00 Driver Version: 01.00 |\n"
+              << kSmiDivider << "\n"
+              << "CPU-Util: " << formatPercent(report.coresUsed, report.coreCount) << "\n"
+              << "Memory Usage: " << report.usedBytes << "B / " << report.totalBytes << "B\n"
+              << "Memory Util: " << formatPercent(report.usedBytes, report.totalBytes) << "\n"
+              << "\n"
+              << std::string(std::string(kSmiDivider).size(), '=') << "\n"
+              << "Running processes and memory usage:\n"
+              << kSmiDivider << "\n";
+    for (const ProcessMemory& process : report.processes) {
+        std::cout << process.name << " " << process.bytes << "B\n";
+    }
+    std::cout << kSmiDivider << "\n";
+}
+
+void Console::vmstat() const {
+    // Laid out like Linux's "vmstat -s": one right-aligned number per line, then what it counts.
+    MemoryReport report = scheduler->memoryReport();
+    const std::pair<uint64_t, const char*> rows[] = {
+        {report.totalBytes, "B total memory"},
+        {report.usedBytes, "B used memory"},
+        {report.totalBytes - report.usedBytes, "B free memory"},
+        {report.idleTicks, "idle cpu ticks"},
+        {report.activeTicks, "active cpu ticks"},
+        {report.idleTicks + report.activeTicks, "total cpu ticks"},
+        {report.pagedIn, "pages paged in"},
+        {report.pagedOut, "pages paged out"},
+    };
+    for (const auto& [value, label] : rows) {
+        std::cout << std::right << std::setw(13) << value << " " << label << "\n";
+    }
 }

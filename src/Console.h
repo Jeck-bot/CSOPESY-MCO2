@@ -18,11 +18,15 @@ private:
     // Runs one main menu command. Returns false when the console should close.
     bool handleCommand(const std::string& line);
 
-    void initialize();                          // initialize
-    bool screenCreate(const std::string& name); // screen -s <name>
-    bool screenResume(const std::string& name); // screen -r <name>
-    void screenList() const;                    // screen -ls
-    void reportUtil() const;                    // report-util
+    void initialize();                                                // initialize
+    bool screenCreate(const std::string& name, const std::string& size); // screen -s <name> <size>
+    bool screenOpen(const std::string& name);                         // screen -s <name>
+    bool screenCreateProgram(const std::string& arguments);           // screen -c <name> [<size>] "<...>"
+    bool screenResume(const std::string& name);                       // screen -r <name>
+    void screenList() const;                                          // screen -ls
+    void reportUtil() const;                                          // report-util
+    void processSmi() const;                                          // process-smi (main menu)
+    void vmstat() const;                                              // vmstat
 
     // Process screen: handles process-smi until "exit". Returns false at the end of input.
     bool attach(const std::string& name);

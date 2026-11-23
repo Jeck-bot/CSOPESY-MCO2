@@ -38,6 +38,10 @@ LONG=$'num-cpu 1\nscheduler "fcfs"\nquantum-cycles 5\nbatch-process-freq 1\nmin-
 BATCH=$'num-cpu 4\nscheduler "rr"\nquantum-cycles 5\nbatch-process-freq 1\nmin-ins 1000\nmax-ins 1000\ndelay-per-exec 0'
 HOLD=$'num-cpu 3\nscheduler "fcfs"\nquantum-cycles 5\nbatch-process-freq 1\nmin-ins 1000\nmax-ins 1000\ndelay-per-exec 4294967296'
 STRESS=$'num-cpu 128\nscheduler "rr"\nquantum-cycles 2\nbatch-process-freq 1\nmin-ins 1\nmax-ins 50\ndelay-per-exec 0'
+TINY=$'num-cpu 4\nscheduler "rr"\nquantum-cycles 5\nbatch-process-freq 1\nmin-ins 100\nmax-ins 100\ndelay-per-exec 0\nmax-overall-mem 256\nmem-per-frame 64\nmin-mem-per-proc 256\nmax-mem-per-proc 1024'
+MEMORY_DEFAULTS='max-overall-mem 16384, mem-per-frame 256, min-mem-per-proc 4096, max-mem-per-proc 4096'
+# The spec's sample screen -c program, as typed in the console (with \" inside the quotes).
+SPEC='DECLARE varA 10; DECLARE varB 5; ADD varA varA varB; WRITE 0x500 varA; READ varC 0x500; PRINT(\"Result: \" + varC)'
 
 # Only "initialize" and "exit" work before initialize.
 run "$DEFAULT" "echo 'screen -ls'; echo scheduler-start; echo exit"
@@ -48,8 +52,15 @@ verify "prompt is root:\\>" grep -q 'root:\\> ' "$OUT"
 
 # initialize reads config.txt.
 run "$DEFAULT" "echo initialize; echo initialize; echo exit"
-expect "initialize summary" '^Initialized: num-cpu 4, scheduler rr, quantum-cycles 5, batch-process-freq 1, min-ins 1000, max-ins 2000, delay-per-exec 0$'
+expect "initialize summary" "^Initialized: num-cpu 4, scheduler rr, quantum-cycles 5, batch-process-freq 1, min-ins 1000, max-ins 2000, delay-per-exec 0, $MEMORY_DEFAULTS\$"
 expect "second initialize" '^Already initialized\.$'
+verify "backing store file created" test -f "$WORK/csopesy-backing-store.txt"
+
+# The memory parameters are read and checked.
+run "$TINY" "echo initialize; echo exit"
+expect "memory parameters" '^Initialized: .*, max-overall-mem 256, mem-per-frame 64, min-mem-per-proc 256, max-mem-per-proc 1024$'
+run "${TINY/mem-per-frame 64/mem-per-frame 100}" "echo initialize; echo exit"
+expect "memory sizes must be powers of 2" 'Invalid mem-per-frame "100": must be a power of 2 from 64 to 65536\.'
 
 # A bad or missing config.txt leaves the console uninitialized.
 run 'num-cpu 0' "echo initialize; echo 'screen -ls'; echo exit"
@@ -60,20 +71,26 @@ expect "missing config reported" 'Could not open config\.txt'
 
 # One-line config, quoted upper-case scheduler, and the "delays-per-exec" spelling.
 run 'num-cpu 2 scheduler "FCFS" quantum-cycles 3 batch-process-freq 4 min-ins 5 max-ins 6 delays-per-exec 7' "echo initialize; echo exit"
-expect "config variants" '^Initialized: num-cpu 2, scheduler fcfs, quantum-cycles 3, batch-process-freq 4, min-ins 5, max-ins 6, delay-per-exec 7$'
+expect "config variants" "^Initialized: num-cpu 2, scheduler fcfs, quantum-cycles 3, batch-process-freq 4, min-ins 5, max-ins 6, delay-per-exec 7, $MEMORY_DEFAULTS\$"
 
 # screen -s, process-smi, Finished!, then the finished process can't be opened again.
-run "$QUICK" "echo initialize; echo 'screen -s A'; sleep 3; echo process-smi; echo exit; echo 'screen -r A'; echo 'screen -s A'; echo exit"
+run "$QUICK" "echo initialize; echo 'screen -s A 256'; sleep 3; echo process-smi; echo exit; echo 'screen -r A'; echo 'screen -s A 256'; echo exit"
 expect "process name" '^Process name: A$'
 expect "process id" '^ID: 1$'
 expect "logs header" '^Logs:$'
-expect "log line format" '^\([0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}(AM|PM)\) Core:[0-9]+ "Value from: [0-9]+"$'
+expect "log line format" '^\([0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}(AM|PM)\) Core:[0-9]+ "Hello world from A!"$'
 expect "finished" '^Finished!$'
 expect "screen -r on a finished process" '^Process A not found\.$'
 expect "screen -s on a finished name" '^Process A already exists\.$'
 
+# screen -s needs a memory size that is a power of 2 from 64 to 65536.
+run "$QUICK" "echo initialize; echo 'screen -s a 100'; echo 'screen -s b 131072'; echo 'screen -s c 32'; echo 'screen -s d abc'; echo 'screen -s e'; echo 'screen -s'; echo exit"
+verify "invalid memory sizes" test "$(count '^invalid memory allocation$')" -eq 4
+verify "screen -s usage" test "$(count '^Usage: screen -s <process name> <memory size>$')" -eq 2
+reject "no process was made by screen -s" '^Process name:'
+
 # A running process shows its progress and can be reopened with screen -s or screen -r.
-run "$LONG" "echo initialize; echo 'screen -s B'; sleep 1; echo process-smi; echo exit; echo 'screen -s B'; echo exit; echo 'screen -r B'; echo exit; echo 'screen -r nobody'; echo exit"
+run "$LONG" "echo initialize; echo 'screen -s B 1024'; sleep 1; echo process-smi; echo exit; echo 'screen -s B'; echo exit; echo 'screen -r B'; echo exit; echo 'screen -r nobody'; echo exit"
 expect "current instruction line" '^Current instruction line: [0-9]+$'
 expect "lines of code" '^Lines of code: 100000$'
 verify "running process reopens" test "$(count '^Process name: B$')" -ge 4
@@ -81,7 +98,7 @@ expect "unknown process" '^Process nobody not found\.$'
 reject "running name is not refused" 'already exists'
 
 # Unknown commands, in the main menu and inside a screen.
-run "$LONG" "echo initialize; echo foo; echo 'screen -s C'; echo 'screen -ls'; echo exit; echo exit"
+run "$LONG" "echo initialize; echo foo; echo 'screen -s C 1024'; echo 'screen -ls'; echo exit; echo exit"
 verify "unknown commands" test "$(count '^Command not recognized\.$')" -eq 2
 
 # Commands ignore case; the spec's other spellings work.
@@ -103,20 +120,20 @@ expect "generated process opens" '^Process name: p05$'
 expect "generation stopped" '^Process p450 not found\.$'
 
 # Utilization percentage with a fraction.
-run "$HOLD" "echo initialize; echo 'screen -s A'; echo exit; echo 'screen -s B'; echo exit; sleep 1; echo 'screen -ls'; echo exit"
+run "$HOLD" "echo initialize; echo 'screen -s A 1024'; echo exit; echo 'screen -s B 1024'; echo exit; sleep 1; echo 'screen -ls'; echo exit"
 expect "two of three cores" '^CPU utilization: 66\.67%$'
 expect "cores used 2" '^Cores used: 2$'
 expect "cores available 1" '^Cores available: 1$'
 
 # report-util saves exactly what screen -ls prints.
-run "$HOLD" "echo initialize; echo 'screen -s A'; echo exit; sleep 1; echo 'screen -ls'; echo report-util; echo exit"
+run "$HOLD" "echo initialize; echo 'screen -s A 1024'; echo exit; sleep 1; echo 'screen -ls'; echo report-util; echo exit"
 expect "report path" '^Report generated at .*/tests/work/csopesy-log\.txt!$'
 verify "report file written" test -f "$WORK/csopesy-log.txt"
 listed=$(awk '/^CPU utilization/{on=1; d=0} on{print} on && /^-{40}$/{d++; if (d == 2) on=0}' "$CLEAN")
 verify "report matches screen -ls" test "$listed" == "$(tr -d '\r' < "$WORK/csopesy-log.txt")"
 
 # FCFS keeps a busy-waiting process on its core; RR rotates the two processes.
-cmds="echo initialize; echo 'screen -s A'; echo exit; echo 'screen -s B'; echo exit; sleep 1"
+cmds="echo initialize; echo 'screen -s A 1024'; echo exit; echo 'screen -s B 1024'; echo exit; sleep 1"
 for i in 1 2 3 4 5 6 7 8 9 10; do cmds="$cmds; echo 'screen -ls'; sleep 0.2"; done
 run "${HOLD/num-cpu 3/num-cpu 1}" "$cmds; echo exit"
 verify "fcfs keeps one process on the core" test "$(runningOnCoreZero)" -eq 1
@@ -124,12 +141,70 @@ run "$(printf '%s' "${HOLD/num-cpu 3/num-cpu 1}" | sed 's/"fcfs"/"rr"/')" "$cmds
 verify "rr rotates processes" test "$(runningOnCoreZero)" -eq 2
 
 # delay-per-exec slows a process down.
-samples="echo initialize; echo 'screen -s A'; sleep 1; echo process-smi; sleep 2; echo process-smi; echo exit; echo exit"
+samples="echo initialize; echo 'screen -s A 1024'; sleep 1; echo process-smi; sleep 2; echo process-smi; echo exit; echo exit"
 run "$LONG" "$samples"
 fast=$(progressBetweenSamples)
 run "${LONG/delay-per-exec 0/delay-per-exec 9}" "$samples"
 slow=$(progressBetweenSamples)
 verify "delay slows progress ($fast vs $slow)" test "${fast:-0}" -gt $(( ${slow:-0} * 3 ))
+
+# screen -c runs the spec's sample program, with a memory size or a rolled one (4096 by default).
+spec_program() {
+    echo initialize
+    printf '%s\n' "screen -c p2 4096 \"$SPEC\""
+    sleep 1; echo process-smi; echo exit
+    printf '%s\n' "screen -c process2 \"$SPEC\""
+    sleep 1; echo process-smi; echo exit; echo exit
+}
+run "$QUICK" spec_program
+# The screen that screen -c opens may already show the end, so count at least one per process.
+verify "spec program prints Result: 15" test "$(count 'Core:[0-9]+ "Result: 15"$')" -ge 2
+verify "spec programs finish" test "$(count '^Finished!$')" -ge 2
+expect "screen -c opens the process" '^Process name: process2$'
+
+# screen -c needs 1 to 50 valid instructions in quotes, and a valid memory size if one is given.
+FIFTY_ONE=$(for i in $(seq 51); do printf 'SLEEP 1; '; done)
+bad_programs() {
+    echo initialize
+    echo 'screen -c q 256 ""'
+    printf '%s\n' "screen -c q 256 \"$FIFTY_ONE\""
+    echo 'screen -c q 256 "FOO 1"'
+    echo 'screen -c q'
+    echo 'screen -c q 100 "SLEEP 1"'
+    echo exit
+}
+run "$QUICK" bad_programs
+verify "invalid screen -c commands" test "$(count '^invalid command$')" -eq 4
+expect "invalid screen -c memory size" '^invalid memory allocation$'
+reject "no process was made by screen -c" '^Process name:'
+
+# A memory access violation shuts the process down; process-smi and screen -r report it.
+run "$QUICK" "echo initialize; echo 'screen -c f 64 \"WRITE 0x500 1\"'; sleep 1; echo process-smi; echo exit; echo 'screen -r f'; echo 'screen -ls'; echo exit"
+expect "violation on screen -r" '^Process f shut down due to memory access violation error that occurred at [0-9]{2}:[0-9]{2}:[0-9]{2}\. 0x500 invalid\.$'
+verify "violation in process-smi too" test "$(count '^Process f shut down due to memory access violation')" -ge 2
+expect "shut-down process listed with its progress" '^f +\(.*\)  Finished  0 / 1$'
+
+# Main menu process-smi and vmstat. A runs DECLARE (page 0, 256 bytes) and then busy-waits.
+run "$HOLD" "echo initialize; echo 'screen -c A 1024 \"DECLARE x 1; PRINT(x)\"'; echo exit; sleep 1; echo process-smi; echo vmstat; echo exit"
+expect "process-smi header" '^\| PROCESS-SMI V01\.00 Driver Version: 01\.00 \|$'
+expect "process-smi cpu" '^CPU-Util: 33\.33%$'
+expect "process-smi memory usage" '^Memory Usage: 256B / 16384B$'
+expect "process-smi memory util" '^Memory Util: 1\.56%$'
+expect "process-smi process list" '^Running processes and memory usage:$'
+expect "process-smi row" '^A 256B$'
+expect "vmstat total memory" '^ +16384 B total memory$'
+expect "vmstat used memory" '^ +256 B used memory$'
+expect "vmstat free memory" '^ +16128 B free memory$'
+for label in 'idle cpu ticks' 'active cpu ticks' 'total cpu ticks' 'pages paged in' 'pages paged out'; do
+    expect "vmstat $label" "^ +[0-9]+ $label\$"
+done
+
+# With 4 frames for many processes, pages go to the backing store and come back.
+run "$TINY" "echo initialize; echo scheduler-start; sleep 3; echo scheduler-stop; echo vmstat; echo exit"
+pagedOut=$(grep -E 'pages paged out$' "$CLEAN" | grep -oE '[0-9]+' | head -1)
+verify "pages paged out when memory is short (${pagedOut:-none})" test "${pagedOut:-0}" -gt 0
+expect "tiny total memory" '^ +256 B total memory$'
+verify "backing store lists swapped-out pages" test "$(grep -c ' page [0-9]*:' "$WORK/csopesy-backing-store.txt")" -gt 0
 
 # 128 cores with nonstop batch generation stays responsive and exits cleanly.
 run "$STRESS" "echo initialize; echo scheduler-start; sleep 20; echo 'screen -ls'; echo scheduler-stop; echo exit"
