@@ -152,7 +152,7 @@ bool Console::screenCreate(const std::string& name) {
     // A name that is still running opens that process: the spec has users open processes made
     // by scheduler-start with "screen -s <process name>".
     if (!existing) {
-        scheduler->createProcess(name);
+        scheduler->createProcess(name, scheduler->rollMemorySize());
     }
     return attach(name);
 }

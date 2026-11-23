@@ -1007,162 +1007,324 @@ Instruction makeSleep(uint8_t ticks) {
     return sleep;
 }
 
-bool hasValue(const Process& process, const std::string& variable, uint16_t expected) {
-    auto found = process.getVariables().find(variable);
-    return found != process.getVariables().end() && found->second == expected;
+Instruction makeRead(const std::string& variable, uint64_t address) {
+    Instruction read = makeInstruction(InstructionType::READ);
+    read.variable = variable;
+    read.address = address;
+    return read;
 }
+
+Instruction makeWrite(uint64_t address, Operand value) {
+    Instruction write = makeInstruction(InstructionType::WRITE);
+    write.address = address;
+    write.first = value;
+    return write;
+}
+
+const std::string kProcessStore = tempPath("csopesy-test-process-store.txt");
+
+// Pages in what the process's next instruction needs (allocating its memory first), then runs it.
+StepResult runOne(Process& process, MemoryManager& memory, int core = 0) {
+    memory.allocate(process.getId(), process.getName(), process.getMemoryBytes());
+    memory.pageIn(process.getId(), process.pagesFor(process.peek(), memory.frameBytes()));
+    StepResult result = process.step(core, memory);
+    memory.unpin(process.getId());
+    return result;
+}
+
+// Runs the process until it finishes, at most limit steps, and returns the number of steps.
+int runToEnd(Process& process, MemoryManager& memory, int limit = 1000) {
+    int steps = 0;
+    while (!process.isFinished() && steps < limit) {
+        runOne(process, memory);
+        ++steps;
+    }
+    return steps;
+}
+
+// A 1024-byte process with its symbol table page loaded, for calling execute() directly.
+struct LoadedProcess {
+    MemoryManager memory{16384, 256, kProcessStore};
+    Process process{1, "p", 1024, 10, 1};
+
+    LoadedProcess() {
+        memory.allocate(1, "p", 1024);
+        memory.pageIn(1, {0});
+    }
+
+    bool run(const Instruction& instruction, int core = 0) {
+        return process.execute(instruction, core, memory);
+    }
+
+    bool has(const std::string& variable, uint16_t expected) const {
+        std::optional<uint16_t> value = process.variable(variable, memory);
+        return value.has_value() && *value == expected;
+    }
+};
 
 }  // namespace
 
 TEST(newProcessStartsAtLineZero) {
     std::time_t before = std::time(nullptr);
-    Process process(7, "screen_01", 50, 1);
+    Process process(7, "screen_01", 1024, 50, 1);
     std::time_t after = std::time(nullptr);
     CHECK(process.getId() == 7);
     CHECK(process.getName() == "screen_01");
+    CHECK(process.getMemoryBytes() == 1024);
     CHECK(process.getTotalInstructions() == 50);
     CHECK(process.getExecuted() == 0);
-    CHECK(!process.isFinished());
+    CHECK(!process.isFinished() && !process.hasCrashed());
+    CHECK(process.variableCount() == 0);
     CHECK(process.getCreatedAt() >= before && process.getCreatedAt() <= after);
 }
 
 TEST(declareSetsTheVariable) {
-    Process process(1, "p", 10, 1);
-    process.execute(makeDeclare("x", 5), 0);
-    CHECK(hasValue(process, "x", 5));
+    LoadedProcess loaded;
+    CHECK(loaded.run(makeDeclare("x", 5)));
+    CHECK(loaded.has("x", 5));
 }
 
 TEST(addStoresTheSum) {
-    Process process(1, "p", 10, 1);
-    process.execute(makeArithmetic(InstructionType::ADD, "x", literal(3), literal(4)), 0);
-    CHECK(hasValue(process, "x", 7));
+    LoadedProcess loaded;
+    loaded.run(makeArithmetic(InstructionType::ADD, "x", literal(3), literal(4)));
+    CHECK(loaded.has("x", 7));
 }
 
 TEST(addClampsAtUint16Max) {
-    Process process(1, "p", 10, 1);
-    process.execute(makeArithmetic(InstructionType::ADD, "x", literal(65000), literal(1000)), 0);
-    CHECK(hasValue(process, "x", 65535));
+    LoadedProcess loaded;
+    loaded.run(makeArithmetic(InstructionType::ADD, "x", literal(65000), literal(1000)));
+    CHECK(loaded.has("x", 65535));
 }
 
 TEST(subtractClampsAtZero) {
-    Process process(1, "p", 10, 1);
-    process.execute(makeArithmetic(InstructionType::SUBTRACT, "x", literal(5), literal(10)), 0);
-    CHECK(hasValue(process, "x", 0));
+    LoadedProcess loaded;
+    loaded.run(makeArithmetic(InstructionType::SUBTRACT, "x", literal(5), literal(10)));
+    CHECK(loaded.has("x", 0));
 }
 
 TEST(arithmeticReadsVariables) {
-    Process process(1, "p", 10, 1);
-    process.execute(makeDeclare("y", 10), 0);
-    process.execute(makeArithmetic(InstructionType::ADD, "x", variableOperand("y"), variableOperand("y")), 0);
-    process.execute(makeArithmetic(InstructionType::SUBTRACT, "z", variableOperand("x"), literal(5)), 0);
-    CHECK(hasValue(process, "x", 20));
-    CHECK(hasValue(process, "z", 15));
+    LoadedProcess loaded;
+    loaded.run(makeDeclare("y", 10));
+    loaded.run(makeArithmetic(InstructionType::ADD, "x", variableOperand("y"), variableOperand("y")));
+    loaded.run(makeArithmetic(InstructionType::SUBTRACT, "z", variableOperand("x"), literal(5)));
+    CHECK(loaded.has("x", 20));
+    CHECK(loaded.has("z", 15));
 }
 
 TEST(undeclaredVariablesAreDeclaredAsZero) {
-    Process process(1, "p", 10, 1);
-    process.execute(makeArithmetic(InstructionType::ADD, "x", variableOperand("y"), literal(1)), 0);
-    CHECK(hasValue(process, "x", 1));
-    CHECK(hasValue(process, "y", 0));
+    LoadedProcess loaded;
+    loaded.run(makeArithmetic(InstructionType::ADD, "x", variableOperand("y"), literal(1)));
+    CHECK(loaded.has("x", 1));
+    CHECK(loaded.has("y", 0));
+}
+
+TEST(variablesAreStoredInTheSymbolTable) {
+    LoadedProcess loaded;
+    loaded.run(makeDeclare("a", 5));
+    loaded.run(makeDeclare("b", 0x1234));
+    CHECK(loaded.memory.read16(1, 0) == 5);      // variable 0 is at address 0
+    CHECK(loaded.memory.read16(1, 2) == 0x1234); // variable 1 is at address 2
+    CHECK(loaded.process.variableCount() == 2);
+}
+
+TEST(theSymbolTableHoldsThirtyTwoVariables) {
+    LoadedProcess loaded;
+    bool declared = true;
+    for (int i = 0; i < 32; ++i) {
+        declared = declared && loaded.run(makeDeclare("v" + std::to_string(i), static_cast<uint16_t>(i + 1)));
+    }
+    CHECK(declared);
+    CHECK(loaded.run(makeDeclare("v32", 99))); // ignored: the symbol table is full
+    CHECK(loaded.process.variableCount() == 32);
+    CHECK(!loaded.process.variable("v32", loaded.memory).has_value());
+    CHECK(loaded.has("v0", 1) && loaded.has("v31", 32));
+    loaded.run(makeArithmetic(InstructionType::ADD, "v31", variableOperand("v32"), literal(1)));
+    CHECK(loaded.has("v31", 1)); // v32 can't be declared, so it reads as 0
+}
+
+TEST(ignoredDeclarationsStillCountAsExecuted) {
+    std::vector<Instruction> program;
+    for (int i = 0; i < 33; ++i) {
+        program.push_back(makeDeclare("v" + std::to_string(i), 7));
+    }
+    program.push_back(makePrint("done"));
+    MemoryManager memory(16384, 256, kProcessStore);
+    Process process(1, "p", 1024, program);
+    for (int i = 0; i < 33; ++i) {
+        runOne(process, memory);
+    }
+    CHECK(process.getExecuted() == 33);
+    CHECK(process.variableCount() == 32);
+    CHECK(!process.variable("v32", memory).has_value());
 }
 
 TEST(printLogsTheMessageWithCoreAndTime) {
-    Process process(1, "p01", 10, 1);
+    LoadedProcess loaded;
     std::time_t before = std::time(nullptr);
-    process.execute(makePrint("Hello world from p01!"), 2);
+    loaded.run(makePrint("Hello world from p01!"), 2);
     std::time_t after = std::time(nullptr);
-    CHECK(process.getLogs().size() == 1);
-    if (process.getLogs().size() == 1) {
-        const LogEntry& log = process.getLogs()[0];
-        CHECK(log.text == "Hello world from p01!");
-        CHECK(log.core == 2);
-        CHECK(log.time >= before && log.time <= after);
+    const std::vector<LogEntry>& logs = loaded.process.getLogs();
+    CHECK(logs.size() == 1);
+    if (logs.size() == 1) {
+        CHECK(logs[0].text == "Hello world from p01!");
+        CHECK(logs[0].core == 2);
+        CHECK(logs[0].time >= before && logs[0].time <= after);
     }
 }
 
 TEST(printAppendsTheVariableValue) {
-    Process process(1, "p", 10, 1);
-    process.execute(makeDeclare("x", 5), 0);
-    process.execute(makePrint("Value from: ", "x"), 0);
-    process.execute(makePrint("Undeclared: ", "w"), 0);
-    CHECK(process.getLogs().size() == 2);
-    if (process.getLogs().size() == 2) {
-        CHECK(process.getLogs()[0].text == "Value from: 5");
-        CHECK(process.getLogs()[1].text == "Undeclared: 0");
+    LoadedProcess loaded;
+    loaded.run(makeDeclare("x", 5));
+    loaded.run(makePrint("Value from: ", "x"));
+    loaded.run(makePrint("Undeclared: ", "w"));
+    const std::vector<LogEntry>& logs = loaded.process.getLogs();
+    CHECK(logs.size() == 2);
+    if (logs.size() == 2) {
+        CHECK(logs[0].text == "Value from: 5");
+        CHECK(logs[1].text == "Undeclared: 0");
     }
 }
 
+TEST(writeThenReadGoesThroughMemory) {
+    MemoryManager memory(16384, 256, kProcessStore);
+    Process process(1, "p", 4096,
+                    {makeDeclare("a", 42), makeWrite(0x500, variableOperand("a")), makeRead("b", 0x500),
+                     makeRead("c", 0x200), makePrint("b = ", "b"), makePrint("c = ", "c")});
+    CHECK(runToEnd(process, memory) == 6);
+    const std::vector<LogEntry>& logs = process.getLogs();
+    CHECK(logs.size() == 2);
+    if (logs.size() == 2) {
+        CHECK(logs[0].text == "b = 42");
+        CHECK(logs[1].text == "c = 0"); // memory that was never written reads as 0
+    }
+}
+
+TEST(specProgramPrintsResult15) {
+    std::optional<std::vector<Instruction>> program = parseProgram(kSpecProgram);
+    CHECK(program.has_value());
+    if (!program) {
+        return;
+    }
+    MemoryManager memory(16384, 256, kProcessStore);
+    Process process(1, "process2", 4096, *program);
+    CHECK(process.getTotalInstructions() == 6);
+    for (int i = 0; i < 5; ++i) {
+        runOne(process, memory);
+    }
+    CHECK(process.variable("varC", memory) == std::optional<uint16_t>(15));
+    CHECK(memory.read16(1, 0x500) == 15);
+    CHECK(runOne(process, memory) == StepResult::FINISHED);
+    CHECK(!process.getLogs().empty() && process.getLogs().back().text == "Result: 15");
+}
+
+TEST(pagesForListsTheSymbolTableAndAddressPages) {
+    using Pages = std::vector<uint64_t>;
+    Process process(1, "p", 4096, 10, 1);
+    auto pagesOf = [&process](const Instruction& instruction) { return process.pagesFor(instruction, 256); };
+    CHECK(pagesOf(makeDeclare("x", 1)) == Pages({0}));
+    CHECK(pagesOf(makeWrite(0x500, variableOperand("a"))) == Pages({0, 5}));
+    CHECK(pagesOf(makeWrite(0x500, literal(3))) == Pages({5}));
+    CHECK(pagesOf(makeRead("x", 0x1FF)) == Pages({0, 1, 2})); // the uint16 spans two pages
+    CHECK(pagesOf(makePrint("hi")) == Pages());
+    CHECK(pagesOf(makePrint("x = ", "x")) == Pages({0}));
+    CHECK(pagesOf(makeSleep(2)) == Pages());
+    CHECK(pagesOf(makeRead("x", 4095)) == Pages({0})); // an invalid address loads no page
+}
+
+TEST(accessOutsideTheProcessMemoryCrashesIt) {
+    MemoryManager memory(16384, 256, kProcessStore);
+    Process process(1, "f", 1024, {makeWrite(1022, literal(1)), makeWrite(1023, literal(2)), makePrint("never")});
+    CHECK(runOne(process, memory) == StepResult::RAN); // the last whole uint16 in memory
+    std::time_t before = std::time(nullptr);
+    CHECK(runOne(process, memory) == StepResult::CRASHED);
+    std::time_t after = std::time(nullptr);
+    CHECK(process.hasCrashed() && process.isFinished());
+    CHECK(process.faultAddress() == 1023);
+    CHECK(process.crashedAt() >= before && process.crashedAt() <= after);
+    CHECK(process.getExecuted() == 1 && process.getTotalInstructions() == 3);
+    CHECK(process.getLogs().empty());
+}
+
+TEST(readOutsideTheProcessMemoryCrashesIt) {
+    MemoryManager memory(16384, 256, kProcessStore);
+    Process process(1, "f", 64, {makeRead("x", 0x500)});
+    CHECK(runOne(process, memory) == StepResult::CRASHED);
+    CHECK(process.faultAddress() == 0x500);
+    CHECK(process.variableCount() == 0);
+}
+
 TEST(loopRepeatsItsBody) {
-    Process process(1, "p", 3, 1);
-    process.startLoop(makeLoop(3, {makePrint("hi")}));
-    CHECK(process.step(0) == StepResult::RAN);
-    CHECK(process.step(0) == StepResult::RAN);
-    CHECK(process.step(0) == StepResult::FINISHED);
+    MemoryManager memory(16384, 256, kProcessStore);
+    Process process(1, "p", 1024, {makeLoop(3, {makePrint("hi")})});
+    CHECK(process.getTotalInstructions() == 3);
+    CHECK(runOne(process, memory) == StepResult::RAN);
+    CHECK(runOne(process, memory) == StepResult::RAN);
+    CHECK(runOne(process, memory) == StepResult::FINISHED);
     CHECK(process.getLogs().size() == 3);
     CHECK(process.getExecuted() == 3);
     CHECK(process.isFinished());
 }
 
 TEST(nestedLoopsRunEveryRepetition) {
-    Process process(1, "p", 9, 1);
-    process.startLoop(makeLoop(3, {makePrint("outer"), makeLoop(2, {makeDeclare("x", 1)})}));
-    int steps = 0;
-    StepResult result = StepResult::RAN;
-    while (result != StepResult::FINISHED && steps < 20) {
-        result = process.step(0);
-        ++steps;
-    }
-    CHECK(steps == 9);
+    MemoryManager memory(16384, 256, kProcessStore);
+    Process process(1, "p", 1024, {makeLoop(3, {makePrint("outer"), makeLoop(2, {makeDeclare("x", 1)})})});
+    CHECK(runToEnd(process, memory, 20) == 9);
     CHECK(process.getLogs().size() == 3);
 }
 
 TEST(sleepReturnsSleptWithItsTicks) {
-    Process process(1, "p", 2, 1);
-    process.startLoop(makeLoop(2, {makeSleep(4)}));
-    CHECK(process.step(0) == StepResult::SLEPT);
+    MemoryManager memory(16384, 256, kProcessStore);
+    Process process(1, "p", 1024, {makeLoop(2, {makeSleep(4)})});
+    CHECK(runOne(process, memory) == StepResult::SLEPT);
     CHECK(process.getSleepTicks() == 4);
-    CHECK(process.step(0) == StepResult::FINISHED);
+    CHECK(runOne(process, memory) == StepResult::FINISHED);
+}
+
+TEST(programLengthIsTheSumOfItsStatements) {
+    MemoryManager memory(16384, 256, kProcessStore);
+    Process process(1, "p", 1024, {makeDeclare("x", 1), makeLoop(3, {makePrint("a"), makePrint("b")}), makeSleep(1)});
+    CHECK(process.getTotalInstructions() == 8);
+    CHECK(runToEnd(process, memory) == 8);
 }
 
 TEST(randomProcessesRunExactlyTheirLength) {
     const uint64_t lengths[] = {1, 2, 3, 17, 1000};
+    MemoryManager memory(16384, 256, kProcessStore);
     bool exact = true;
     bool released = true;
+    bool noCrash = true;
     for (uint64_t length : lengths) {
         for (uint32_t seed = 1; seed <= 200; ++seed) {
-            Process process(1, "p", length, seed);
+            Process process(1, "p", 1024, length, seed);
             uint64_t steps = 0;
             while (!process.isFinished() && steps <= length) {
-                process.step(static_cast<int>(steps % 4));
+                noCrash = noCrash && runOne(process, memory, static_cast<int>(steps % 4)) != StepResult::CRASHED;
                 ++steps;
             }
             exact = exact && steps == length && process.getExecuted() == length && process.isFinished();
-            released = released && process.getVariables().empty();
+            released = released && process.variableCount() == 0;
+            memory.release(1);
         }
     }
     CHECK(exact);
     CHECK(released);
+    CHECK(noCrash);
 }
 
-TEST(processesAlternatePrintAndAddOnX) {
-    Process process(1, "p", 100, 3);
-    CHECK(hasValue(process, "x", 0));
-    uint16_t x = 0;
-    bool alternates = true;
-    for (int i = 0; i < 100; ++i) {
-        size_t logsBefore = process.getLogs().size();
-        process.step(0);
-        if (i % 2 == 0) {
-            alternates = alternates && process.getLogs().size() == logsBefore + 1 &&
-                         process.getLogs().back().text == "Value from: " + std::to_string(x);
-        } else if (i < 99) {
-            uint16_t now = process.getVariables().at("x");
-            alternates = alternates && process.getLogs().size() == logsBefore && now >= x + 1 && now <= x + 10;
-            x = now;
-        }
+TEST(generatedProcessesRunTheRandomMix) {
+    // Replaces MCO1's quiz pattern (PRINT and ADD on x, alternating): generated processes run the
+    // random mix again, now with READ and WRITE, and start with no variables.
+    MemoryManager memory(16384, 256, kProcessStore);
+    Process process(1, "p", 1024, 2000, 3);
+    CHECK(!process.variable("x", memory).has_value());
+    std::set<InstructionType> seen;
+    while (!process.isFinished()) {
+        seen.insert(process.peek().type);
+        runOne(process, memory);
     }
-    CHECK(alternates);
-    CHECK(process.isFinished());
+    CHECK(seen.size() == 7 && seen.count(InstructionType::FOR) == 0);
+    CHECK(process.getExecuted() == 2000);
+    std::remove(kProcessStore.c_str());
 }
 
 // ---- Scheduler ----
@@ -1182,6 +1344,8 @@ Config testConfig(uint32_t cores, SchedulerType type, uint64_t quantum, uint64_t
     return config;
 }
 
+const std::string kSchedulerStore = tempPath("csopesy-test-scheduler-store.txt");
+
 std::string onFirstCore(const Utilization& usage) {
     return usage.running.empty() ? "" : usage.running[0].name;
 }
@@ -1200,30 +1364,38 @@ bool hasFinished(const Scheduler& scheduler, const std::string& name) {
     return view && view->finished;
 }
 
+// Ticks until the named process finishes, at most limit times.
+void tickUntilFinished(Scheduler& scheduler, const std::string& name, int limit) {
+    for (int i = 0; i < limit && !hasFinished(scheduler, name); ++i) {
+        scheduler.tick();
+    }
+}
+
 }  // namespace
 
 TEST(createsProcessesWithUniqueNames) {
-    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 10, 10, 0), 1);
-    CHECK(scheduler.createProcess("a"));
-    CHECK(!scheduler.createProcess("a"));
+    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 10, 10, 0), 1, kSchedulerStore);
+    CHECK(scheduler.createProcess("a", 1024));
+    CHECK(!scheduler.createProcess("a", 1024));
     std::optional<ProcessView> view = scheduler.view("a");
     CHECK(view.has_value());
     if (view) {
         CHECK(view->name == "a");
         CHECK(view->id == 1);
+        CHECK(view->memoryBytes == 1024);
         CHECK(view->total == 10);
         CHECK(view->executed == 0);
-        CHECK(!view->finished);
+        CHECK(!view->finished && !view->crashed);
     }
     CHECK(!scheduler.view("missing").has_value());
 }
 
 TEST(processLengthsFollowMinAndMaxIns) {
-    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 3, 7, 0), 1);
+    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 3, 7, 0), 1, kSchedulerStore);
     bool inRange = true;
     for (int i = 0; i < 100; ++i) {
         std::string name = "proc" + std::to_string(i);
-        scheduler.createProcess(name);
+        scheduler.createProcess(name, 1024);
         std::optional<ProcessView> view = scheduler.view(name);
         inRange = inRange && view && view->total >= 3 && view->total <= 7;
     }
@@ -1231,10 +1403,10 @@ TEST(processLengthsFollowMinAndMaxIns) {
 }
 
 TEST(idleCoresTakeReadyProcessesInOrder) {
-    Scheduler scheduler(testConfig(2, SchedulerType::FCFS, 5, 1000, 1000, 0), 1);
-    scheduler.createProcess("a");
-    scheduler.createProcess("b");
-    scheduler.createProcess("c");
+    Scheduler scheduler(testConfig(2, SchedulerType::FCFS, 5, 1000, 1000, 0), 1, kSchedulerStore);
+    scheduler.createProcess("a", 1024);
+    scheduler.createProcess("b", 1024);
+    scheduler.createProcess("c", 1024);
     scheduler.tick();
     Utilization usage = scheduler.utilization();
     CHECK(usage.coreCount == 2);
@@ -1248,7 +1420,7 @@ TEST(idleCoresTakeReadyProcessesInOrder) {
 }
 
 TEST(batchGenerationCreatesAProcessEveryFrequencyTicks) {
-    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 1000, 1000, 0, 3), 1);
+    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 1000, 1000, 0, 3), 1, kSchedulerStore);
     CHECK(scheduler.startBatchGeneration());
     CHECK(!scheduler.startBatchGeneration());
     for (uint64_t i = 0; i < 9 * kTicksPerBatchCycle; ++i) {
@@ -1267,8 +1439,8 @@ TEST(batchGenerationCreatesAProcessEveryFrequencyTicks) {
 }
 
 TEST(batchNamesSkipTakenNamesAndGrowPastTwoDigits) {
-    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 1000, 1000, 0, 1), 1);
-    scheduler.createProcess("p01");
+    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 1000, 1000, 0, 1), 1, kSchedulerStore);
+    scheduler.createProcess("p01", 1024);
     scheduler.startBatchGeneration();
     for (uint64_t i = 0; i < 100 * kTicksPerBatchCycle; ++i) {
         scheduler.tick();
@@ -1279,8 +1451,42 @@ TEST(batchNamesSkipTakenNamesAndGrowPastTwoDigits) {
     CHECK(!scheduler.view("p102").has_value());
 }
 
+TEST(rolledMemorySizesArePowersOfTwoInRange) {
+    Config config = testConfig(1, SchedulerType::FCFS, 5, 1000, 1000, 0);
+    config.minMemPerProc = 64;
+    config.maxMemPerProc = 1024;
+    Scheduler scheduler(config, 1, kSchedulerStore);
+    std::set<uint64_t> sizes;
+    for (int i = 0; i < 500; ++i) {
+        sizes.insert(scheduler.rollMemorySize());
+    }
+    CHECK(sizes == std::set<uint64_t>({64, 128, 256, 512, 1024}));
+}
+
+TEST(batchProcessesGetRolledMemory) {
+    Config config = testConfig(1, SchedulerType::FCFS, 5, 1000, 1000, 0, 1);
+    config.minMemPerProc = 128;
+    config.maxMemPerProc = 256;
+    Scheduler scheduler(config, 1, kSchedulerStore);
+    scheduler.startBatchGeneration();
+    for (uint64_t i = 0; i < 40 * kTicksPerBatchCycle; ++i) {
+        scheduler.tick();
+    }
+    bool inRange = true;
+    std::set<uint64_t> sizes;
+    for (int i = 1; i <= 40; ++i) {
+        std::optional<ProcessView> view = scheduler.view(std::string(i < 10 ? "p0" : "p") + std::to_string(i));
+        inRange = inRange && view && (view->memoryBytes == 128 || view->memoryBytes == 256);
+        if (view) {
+            sizes.insert(view->memoryBytes);
+        }
+    }
+    CHECK(inRange);
+    CHECK(sizes.size() == 2);
+}
+
 TEST(everyProcessFinishesAfterExactlyItsLength) {
-    Scheduler scheduler(testConfig(4, SchedulerType::RR, 2, 1, 60, 0, 1), 3);
+    Scheduler scheduler(testConfig(4, SchedulerType::RR, 2, 1, 60, 0, 1), 3, kSchedulerStore);
     scheduler.startBatchGeneration();
     for (uint64_t i = 0; i < 200 * kTicksPerBatchCycle; ++i) {
         scheduler.tick();
@@ -1298,10 +1504,11 @@ TEST(everyProcessFinishesAfterExactlyItsLength) {
     CHECK(exact);
     CHECK(usage.coresUsed == 0);
     CHECK(usage.running.empty());
+    CHECK(scheduler.memoryReport().usedBytes == 0);
 }
 
 TEST(noProcessRunsOnTwoCoresAtOnce) {
-    Scheduler scheduler(testConfig(128, SchedulerType::RR, 2, 1, 50, 0, 1), 5);
+    Scheduler scheduler(testConfig(128, SchedulerType::RR, 2, 1, 50, 0, 1), 5, kSchedulerStore);
     scheduler.startBatchGeneration();
     bool consistent = true;
     for (int i = 0; i < 1500; ++i) {
@@ -1326,10 +1533,10 @@ TEST(noProcessRunsOnTwoCoresAtOnce) {
 TEST(fcfsNeverPreemptsARunningProcess) {
     // With a long delay, a preempted process would leave while busy-waiting, without having run
     // an instruction. Under FCFS a process only leaves right after running SLEEP or its last line.
-    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 2, 20, 20, 50), 9);
-    scheduler.createProcess("a");
-    scheduler.createProcess("b");
-    scheduler.createProcess("c");
+    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 2, 20, 20, 50), 9, kSchedulerStore);
+    scheduler.createProcess("a", 1024);
+    scheduler.createProcess("b", 1024);
+    scheduler.createProcess("c", 1024);
     std::string previous;
     uint64_t previousExecuted = 0;
     bool neverPreempted = true;
@@ -1351,9 +1558,9 @@ TEST(fcfsNeverPreemptsARunningProcess) {
 TEST(roundRobinPreemptsAfterTheQuantum) {
     // A process may keep the core past its quantum only while the other one sleeps (at most
     // 10 ticks), so with two busy processes no run lasts much longer than the quantum.
-    Scheduler scheduler(testConfig(1, SchedulerType::RR, 3, 20, 20, 50), 9);
-    scheduler.createProcess("a");
-    scheduler.createProcess("b");
+    Scheduler scheduler(testConfig(1, SchedulerType::RR, 3, 20, 20, 50), 9, kSchedulerStore);
+    scheduler.createProcess("a", 1024);
+    scheduler.createProcess("b", 1024);
     std::string previous;
     uint64_t previousExecuted = 0;
     int run = 0;
@@ -1382,8 +1589,8 @@ TEST(roundRobinPreemptsAfterTheQuantum) {
 }
 
 TEST(delayPerExecSpacesInstructions) {
-    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 30, 30, 3), 4);
-    scheduler.createProcess("a");
+    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 30, 30, 3), 4, kSchedulerStore);
+    scheduler.createProcess("a", 1024);
     uint64_t lastExecuted = 0;
     int lastChange = -1000;
     bool spaced = true;
@@ -1400,9 +1607,112 @@ TEST(delayPerExecSpacesInstructions) {
     CHECK(hasFinished(scheduler, "a"));
 }
 
+TEST(pageFaultsWaitForACoreAndCostATick) {
+    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 1, 1, 0), 1, kSchedulerStore);
+    CHECK(scheduler.createProcess("p", 1024, {makeDeclare("x", 5), makePrint("x = ", "x")}));
+    CHECK(scheduler.memoryReport().usedBytes == 0);
+    scheduler.tick(); // p gets the core
+    CHECK(executedOf(scheduler, "p") == 0 && scheduler.memoryReport().usedBytes == 0);
+    scheduler.tick(); // page fault: page 0 is loaded and DECLARE waits
+    MemoryReport report = scheduler.memoryReport();
+    CHECK(executedOf(scheduler, "p") == 0);
+    CHECK(report.usedBytes == 256 && report.pagedIn == 1 && report.pagedOut == 0);
+    CHECK(report.processes.size() == 1 && report.processes[0].name == "p" && report.processes[0].bytes == 256);
+    scheduler.tick(); // DECLARE runs
+    CHECK(executedOf(scheduler, "p") == 1);
+    scheduler.tick(); // PRINT runs without a fault: page 0 is still loaded
+    std::optional<ProcessView> view = scheduler.view("p");
+    CHECK(view && view->finished && !view->crashed && view->logs.size() == 1 && view->logs[0].text == "x = 5");
+    CHECK(scheduler.memoryReport().usedBytes == 0); // a finished process frees its frames
+}
+
+TEST(specProgramFinishesWithResult15) {
+    Scheduler scheduler(testConfig(4, SchedulerType::RR, 5, 1, 1, 0), 1, kSchedulerStore);
+    std::optional<std::vector<Instruction>> program = parseProgram(kSpecProgram);
+    CHECK(program.has_value());
+    if (!program) {
+        return;
+    }
+    CHECK(scheduler.createProcess("process2", 4096, *program));
+    CHECK(!scheduler.createProcess("process2", 4096, *program));
+    tickUntilFinished(scheduler, "process2", 100);
+    std::optional<ProcessView> view = scheduler.view("process2");
+    CHECK(view && view->finished && view->executed == 6 && view->total == 6 && view->memoryBytes == 4096);
+    CHECK(view && !view->logs.empty() && view->logs.back().text == "Result: 15");
+}
+
+TEST(processesFinishWhenMemoryIsScarce) {
+    // 2 frames of 64 bytes for 3 processes whose WRITE and READ each need 2 pages at once.
+    Config config = testConfig(2, SchedulerType::RR, 2, 1, 1, 0);
+    config.maxOverallMem = 128;
+    config.memPerFrame = 64;
+    Scheduler scheduler(config, 1, kSchedulerStore);
+    const char* const names[] = {"a", "b", "c"};
+    for (const char* name : names) {
+        CHECK(scheduler.createProcess(name, 256,
+                                      {makeDeclare("x", 7), makeWrite(0x80, variableOperand("x")), makeRead("y", 0x80),
+                                       makePrint("y = ", "y")}));
+    }
+    bool storeUsed = false;
+    for (int i = 0; i < 5000 && scheduler.utilization().finished.size() < 3; ++i) {
+        scheduler.tick();
+        storeUsed = storeUsed || fileLines(kSchedulerStore).size() > 1;
+    }
+    CHECK(scheduler.utilization().finished.size() == 3);
+    for (const char* name : names) {
+        std::optional<ProcessView> view = scheduler.view(name);
+        CHECK(view && !view->crashed && !view->logs.empty() && view->logs.back().text == "y = 7");
+    }
+    MemoryReport report = scheduler.memoryReport();
+    CHECK(report.pagedOut > 0 && report.pagedIn > report.pagedOut);
+    CHECK(report.usedBytes == 0);
+    CHECK(storeUsed);
+}
+
+TEST(memoryAccessViolationShutsTheProcessDown) {
+    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 1, 1, 0), 1, kSchedulerStore);
+    CHECK(scheduler.createProcess("f", 64,
+                                  {makeDeclare("x", 1), makeWrite(0x500, variableOperand("x")), makePrint("never")}));
+    std::time_t before = std::time(nullptr);
+    tickUntilFinished(scheduler, "f", 100);
+    std::time_t after = std::time(nullptr);
+    std::optional<ProcessView> view = scheduler.view("f");
+    CHECK(view && view->finished && view->crashed);
+    CHECK(view && view->faultAddress == 0x500 && view->crashedAt >= before && view->crashedAt <= after);
+    CHECK(view && view->executed == 1 && view->total == 3 && view->logs.empty());
+    CHECK(scheduler.memoryReport().usedBytes == 0);
+    Utilization usage = scheduler.utilization();
+    CHECK(usage.finished.size() == 1);
+    if (usage.finished.size() == 1) {
+        CHECK(usage.finished[0].name == "f" && usage.finished[0].executed == 1 && usage.finished[0].total == 3);
+    }
+}
+
+TEST(memoryReportCountsCoreTicksAndProcessMemory) {
+    Scheduler scheduler(testConfig(2, SchedulerType::FCFS, 5, 1, 1, 0), 1, kSchedulerStore);
+    std::vector<Instruction> program;
+    for (int i = 0; i < 20; ++i) {
+        program.push_back(makeDeclare("x", static_cast<uint16_t>(i)));
+    }
+    CHECK(scheduler.createProcess("p", 1024, program));
+    for (int i = 0; i < 10; ++i) {
+        scheduler.tick();
+    }
+    MemoryReport report = scheduler.memoryReport();
+    CHECK(report.coreCount == 2 && report.coresUsed == 1);
+    CHECK(report.activeTicks == 9 && report.idleTicks == 11); // p is on core 0 from the second tick
+    CHECK(report.totalBytes == 16384 && report.usedBytes == 256);
+    uint64_t listed = 0;
+    for (const ProcessMemory& row : report.processes) {
+        listed += row.bytes;
+    }
+    CHECK(listed == report.usedBytes);
+    CHECK(executedOf(scheduler, "p") == 8); // one page fault tick, then one DECLARE per tick
+}
+
 TEST(backgroundThreadRunsTicksUntilStopped) {
-    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 1000000, 1000000, 0), 1);
-    scheduler.createProcess("a");
+    Scheduler scheduler(testConfig(1, SchedulerType::FCFS, 5, 1000000, 1000000, 0), 1, kSchedulerStore);
+    scheduler.createProcess("a", 1024);
     scheduler.start();
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (executedOf(scheduler, "a") < 5 && std::chrono::steady_clock::now() < deadline) {
