@@ -10,3 +10,6 @@ csopesy-log.txt
 
 # Scratch files from tests/cli.sh
 tests/work/
+
+# Generated backing store
+csopesy-backing-store.txt

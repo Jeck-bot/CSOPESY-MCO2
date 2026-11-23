@@ -1,5 +1,5 @@
-CSOPESY MCO1 - Process Scheduler and CLI
-========================================
+CSOPESY MCO2 - Multitasking OS
+==============================
 
 Group members
 -------------
