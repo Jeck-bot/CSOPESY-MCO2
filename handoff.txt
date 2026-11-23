@@ -1,0 +1,128 @@
+CSOPESY MCO2 - Handoff
+======================
+Branch: mco2-memory (11-23-2026, Jack). Delete this file before we submit.
+
+What is done
+------------
+Every MO2 spec feature is implemented on the mco2-memory branch, on top of MCO1:
+- config.txt: max-overall-mem, mem-per-frame, min-mem-per-proc, max-mem-per-proc
+  (powers of 2 from 64 to 65536; "max-mem-proc" is accepted too).
+- screen -s <name> <size>: "invalid memory allocation" for a bad size.
+- screen -c <name> [<size>] "<instructions>": 1 to 50 instructions, otherwise
+  "invalid command". Without a size, one is rolled from min/max-mem-per-proc.
+- READ and WRITE, and a 64-byte symbol table (32 variables) per process.
+  scheduler-start processes run the random instruction mix again, now with
+  READ and WRITE (the MCO1 quiz's PRINT/ADD-on-x pattern is gone).
+- Demand paging with FIFO replacement; the backing store is
+  csopesy-backing-store.txt in the folder the program runs from.
+- Memory access violation: the process shuts down, and screen -r (and
+  process-smi inside its screen) prints the spec's message.
+- Main menu process-smi and vmstat.
+README.txt lists the commands.
+
+What is NOT done yet
+--------------------
+1. NOBODY HAS RUN THE TESTS. My laptop's antivirus blocks newly built .exe
+   files, so I could only check that everything compiles (0 warnings).
+   Please run both test suites first (section 1) and fix whatever fails.
+2. Merge mco2-memory into main once the tests pass.
+3. Rehearse the quiz by hand (section 2).
+4. The PPT technical report (section 3 says where everything is).
+5. Decide the open questions (section 4).
+
+1. Run the tests
+----------------
+Needs Windows, Visual Studio 2022 or its Build Tools, and Git Bash. From the
+repo root, set MSB to your MSBuild.exe:
+    Build Tools:  MSB="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/MSBuild/Current/Bin/MSBuild.exe"
+    Community:    MSB="/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe"
+
+Unit tests:
+    "$MSB" tests/CSOPESY.Tests.vcxproj -p:Configuration=Debug -p:Platform=x64 -v:m
+    tests/x64/Debug/CSOPESY.Tests.exe
+    The last line should be "<N> tests, <M> checks, 0 failures".
+    A failure prints: FAIL [test name] line <n>: <condition>
+
+CLI tests (1 to 2 minutes):
+    "$MSB" CSOPESY.vcxproj -p:Configuration=Release -p:Platform=x64 -v:m
+    bash tests/cli.sh
+    The last line should be "<N> passed, 0 failed".
+    A failure prints: FAIL: <what was checked>. The output of the last
+    program run is in tests/work/clean.txt.
+
+If you can, run them from a folder outside OneDrive: the tests write files a lot.
+
+2. Quiz rehearsal (by hand)
+---------------------------
+Build Release | x64 and run x64\Release\CSOPESY.exe from the repo root:
+    initialize
+    screen -s p1 100            -> invalid memory allocation
+    screen -s p1 256            -> opens p1; process-smi shows its logs; exit
+    screen -c process2 "DECLARE varA 10; DECLARE varB 5; ADD varA varA varB; WRITE 0x500 varA; READ varC 0x500; PRINT(\"Result: \" + varC)"
+                                -> process-smi shows "Result: 15" and Finished!; exit
+    screen -c bad 64 "WRITE 0x500 1"
+                                -> exit, then: screen -r bad
+                                -> Process bad shut down due to memory access violation
+                                   error that occurred at HH:MM:SS. 0x500 invalid.
+    scheduler-start, wait a few seconds, then process-smi and vmstat in the main menu.
+Then set max-overall-mem 256 and mem-per-frame 64 in config.txt, restart, and run
+scheduler-start: vmstat's "pages paged out" goes up, and csopesy-backing-store.txt
+lists the swapped-out pages.
+Note: 0x500 needs at least 2048 bytes, so "screen -c x 256 ..." with the spec's
+program correctly crashes with an access violation.
+
+3. Notes for the PPT (where things are)
+---------------------------------------
+Command recognition: src/Console.cpp (handleCommand) and
+src/InstructionParser.cpp (screen -c instructions).
+
+Process representation and memory addressing: src/Process.h/.cpp.
+- Each process has its own emulated memory of <size> bytes.
+- Bytes 0-63 are the symbol table: variable i is the uint16 at address 2i
+  (little-endian), so 32 variables at most. An instruction that would declare
+  a 33rd variable is ignored (it still counts as executed).
+- READ/WRITE take a hex address from 0 to size-2. Any other address shuts the
+  process down (access violation).
+
+Scheduler: src/Scheduler.cpp (tick). Same FCFS/RR as MCO1, one tick every 10 ms.
+
+Memory management: src/MemoryManager.cpp and src/BackingStore.cpp.
+- Frames = max-overall-mem / mem-per-frame. A process has
+  ceil(size / mem-per-frame) pages.
+- A process gets its page table when it first gets a CPU core, with no page
+  loaded yet.
+- Before each instruction, the core checks the pages it needs: page 0 for
+  variables, and the page(s) of a READ/WRITE address. If one is missing, that
+  tick is a page fault: the pages are loaded, and the instruction runs on the
+  next tick.
+- A free frame is used first. Otherwise the frame loaded longest ago (FIFO) is
+  evicted to the backing store.
+- Pages loaded for a page fault stay pinned until that instruction runs, so
+  cores can't keep evicting each other's pages. Without this, small memory with
+  many cores would freeze.
+- Reading an evicted page back removes it from the backing store.
+  csopesy-backing-store.txt lists every swapped-out page, one line each:
+      <process name> (ID <id>) page <n>: <bytes in hex>
+  It is rewritten at most every 200 ms (rewriting it on every tick slowed
+  everything down).
+- Finished and crashed processes free their frames and backing store pages.
+
+Memory reports:
+- process-smi: CPU-Util, Memory Usage and Memory Util in bytes, and the
+  processes holding frames.
+- vmstat: total/used/free memory in bytes; idle, active and total CPU ticks
+  (counted per core per tick; active means a process is on the core); pages
+  paged in and out.
+
+4. Open questions for the group
+-------------------------------
+- vmstat: page 2 of the spec says vmstat shows "active/inactive processes",
+  but its detailed table (pages 4-5) has no process counts. We follow the
+  table. Adding two lines (processes on cores / processes waiting) to
+  Console::vmstat would be easy.
+- process-smi shows bytes. The spec's mockup shows MiB, but memory here is at
+  most 64 KB, so MiB would always read 0.
+- Known limit: an instruction that needs more pages than there are frames
+  waits forever. Examples: 1 frame, or 2 frames with a screen -c READ/WRITE at
+  an odd address that crosses a page boundary. scheduler-start can't cause it,
+  because its addresses are always even.
