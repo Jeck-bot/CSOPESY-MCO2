@@ -100,7 +100,7 @@ void Console::printBanner() const {
               << "Morgan, Jack Owen\n"
               << "Tenorio, Jeroen Ralph\n"
               << "\n"
-              << "Last updated: 11-04-2026\n"
+              << "Last updated: 11-23-2026\n"
               << "-------------------------------------------------------\n"
               << "\n";
 }
